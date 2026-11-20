@@ -69,6 +69,7 @@ enum Cmd {
     SetTarget(Target),
     SetOutput(String),
     SetBuffer(u32),
+    SetDither(bool),
     Stop,
 }
 
@@ -100,6 +101,11 @@ impl Engine {
         let _ = self.tx.send(Cmd::SetBuffer(ms.clamp(MIN_BUFFER_MS, MAX_BUFFER_MS)));
     }
 
+    /// Silence dither on/off (see [`Output::set_dither`]); takes effect immediately.
+    pub fn set_dither(&self, on: bool) {
+        let _ = self.tx.send(Cmd::SetDither(on));
+    }
+
     pub fn set_output(&self, name: String) {
         let _ = self.tx.send(Cmd::SetOutput(name));
     }
@@ -125,6 +131,7 @@ struct State<F: FnMut(Event)> {
     target: Target,
     output: String,
     buffer_ms: u32,
+    dither: bool,
     emit: F,
     last_output: Option<Result<String, String>>,
 }
@@ -143,6 +150,7 @@ impl<F: FnMut(Event)> State<F> {
         match c {
             Cmd::Stop => return false,
             Cmd::SetTarget(t) => self.target = t,
+            Cmd::SetDither(d) => self.dither = d,
             Cmd::SetBuffer(b) => {
                 if b != self.buffer_ms {
                     self.buffer_ms = b;
@@ -198,7 +206,7 @@ fn run(target: Target, output: String, buffer_ms: u32, rx: Receiver<Cmd>, emit: 
         return;
     }
     wasapi::boost_thread_priority();
-    let mut st = State { target, output, buffer_ms, emit, last_output: None };
+    let mut st = State { target, output, buffer_ms, dither: false, emit, last_output: None };
     loop {
         let out = match Output::open(&st.output, st.buffer_ms) {
             Ok(o) => o,
@@ -210,6 +218,7 @@ fn run(target: Target, output: String, buffer_ms: u32, rx: Receiver<Cmd>, emit: 
                 continue;
             }
         };
+        out.set_dither(st.dither);
         st.report_output(Ok(out.description.clone()));
         match stream(&mut st, &rx, &out) {
             Exit::Stop => return,
@@ -233,6 +242,7 @@ fn stream<F: FnMut(Event)>(st: &mut State<F>, rx: &Receiver<Cmd>, out: &Output) 
             }
         }
     };
+    out.set_dither(st.dither); // may have changed while waiting for the capture
     (st.emit)(Event::Target(pid));
     (st.emit)(Event::Running);
 
@@ -253,6 +263,7 @@ fn stream<F: FnMut(Event)>(st: &mut State<F>, rx: &Receiver<Cmd>, out: &Output) 
                         return Exit::Restart;
                     }
                     retarget |= st.target != before;
+                    out.set_dither(st.dither);
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => return Exit::Stop,

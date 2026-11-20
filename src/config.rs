@@ -19,11 +19,14 @@ pub struct Config {
     pub selected: Option<String>,
     /// Jitter-buffer level in ms: lower = less latency, higher = more robust.
     pub buffer_ms: u32,
+    /// Write a faint +-1 LSB noise instead of exact digital zeros during silence (keeps
+    /// receivers with a silence gate, e.g. RustDesk's encoder, from pausing).
+    pub silence_dither: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { output: DEFAULT_OUTPUT.into(), programs: Vec::new(), selected: None, buffer_ms: crate::engine::DEFAULT_BUFFER_MS }
+        Config { output: DEFAULT_OUTPUT.into(), programs: Vec::new(), selected: None, buffer_ms: crate::engine::DEFAULT_BUFFER_MS, silence_dither: false }
     }
 }
 
@@ -122,6 +125,7 @@ mod tests {
         c.add_program(r"D:\Games\Voice\voice.exe");
         c.select(Some(r"c:/apps/discord/discord.exe"));
         c.output = "CABLE Input (VB-Audio Virtual Cable)".into();
+        c.silence_dither = true;
         c.save(&p).unwrap();
         let back = Config::load(&p).unwrap();
         assert_eq!(back, c);
@@ -156,6 +160,7 @@ mod tests {
         assert_eq!(c.selected, None);
         assert_eq!(c.output, DEFAULT_OUTPUT);
         assert_eq!(c.buffer_ms, crate::engine::DEFAULT_BUFFER_MS, "missing field gets the default");
+        assert!(!c.silence_dither, "dither is off by default");
         std::fs::write(&p, r#"{"buffer_ms":1}"#).unwrap();
         assert_eq!(Config::load(&p).unwrap().buffer_ms, crate::engine::MIN_BUFFER_MS, "clamped");
         std::fs::write(&p, "not json").unwrap();

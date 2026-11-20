@@ -1087,3 +1087,55 @@ fn t11_sound_after_silence() {
     }
     panic!("no valid measurement in 3 attempts");
 }
+
+/// 12. Silence dither (`--silence-dither`): while nothing plays, the cable must never
+/// carry exact digital zeros (receivers such as RustDesk's encoder pause after a run of
+/// all-zero frames), yet stay inaudible (< -80 dBFS); real audio still passes cleanly.
+/// Without the switch the cable stays at exact zeros (unchanged default behaviour).
+#[test]
+fn t12_silence_dither() {
+    let _g = serial();
+    let dummy = start_dummy();
+    let pid = dummy.pid().to_string();
+    for dither in [false, true] {
+        let mut args = vec!["--exclude-pid", pid.as_str()];
+        if dither {
+            args.push("--silence-dither");
+        }
+        let cap = start_capture(&args);
+        thread::sleep(Duration::from_secs(1)); // nothing plays
+        let rec = record(Source::Cable, 2000).join().unwrap();
+        let s = &rec.samples[RATE as usize / 10..]; // skip the recorder's start-up
+        let blocks: Vec<&[f32]> = s.chunks_exact(RATE as usize / 100).collect();
+        let zero_samples = s.iter().filter(|v| **v == 0.0).count();
+        let all_zero_blocks = blocks.iter().filter(|b| b.iter().all(|v| *v == 0.0)).count();
+        let rms = audio_exclude::dsp::rms_db(s);
+        let peak = s.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        println!(
+            "[t12 dither {}] {} samples: {zero_samples} exact zeros, {all_zero_blocks}/{} all-zero 10 ms blocks, rms {rms:.1} dBFS, peak {:.1} dBFS",
+            if dither { "on" } else { "off" },
+            s.len(),
+            blocks.len(),
+            audio_exclude::dsp::to_db(peak)
+        );
+        assert!(rec.gaps == 0, "cable recorder had gaps; rerun");
+        if dither {
+            assert_eq!(all_zero_blocks, 0, "no 10 ms block may be all zeros");
+            assert_eq!(zero_samples, 0, "no sample may be an exact zero");
+            assert!(rms < -80.0 && audio_exclude::dsp::to_db(peak) < -80.0, "dither must be inaudible: rms {rms:.1}, peak {peak}");
+            // and real audio still passes without glitches
+            let cable = record(Source::Cable, 2500);
+            let raw = record(Source::ProcessLoopback(dummy.pid()), 2500);
+            thread::sleep(Duration::from_millis(200));
+            let _t = start_tone(&tone_exe(), F_EXCLUDED, &["--duration", "1800"]);
+            let (cable, raw) = (cable.join().unwrap(), raw.join().unwrap());
+            let (ours, report) = unexplained_glitches(&cable, &raw, F_EXCLUDED);
+            println!("[t12 dither on, tone] {report}");
+            assert!(ours.is_empty(), "glitches with dither on: {ours:?}");
+        } else {
+            assert_eq!(zero_samples, s.len(), "without the switch silence stays exact zeros");
+        }
+        drop(cap);
+        thread::sleep(Duration::from_millis(300));
+    }
+}

@@ -35,6 +35,7 @@ const ID_NONE: usize = 1;
 const ID_ADD: usize = 2;
 const ID_EXIT: usize = 3;
 const ID_OPEN_DIR: usize = 4;
+const ID_DITHER: usize = 5;
 const ID_PROGRAM: usize = 1000; // + index
 const ID_REMOVE: usize = 2000; // + index
 const ID_OUTPUT: usize = 3000; // + index
@@ -251,6 +252,8 @@ impl App {
                 }
             }
             AppendMenuW(m, MF_POPUP, bm.0 as usize, &HSTRING::from(format!("缓冲 / 延迟（{} ms）", self.cfg.buffer_ms)))?;
+            let dither_flags = if self.cfg.silence_dither { MF_STRING | MF_CHECKED } else { MF_STRING };
+            AppendMenuW(m, dither_flags, ID_DITHER, w!("静音时输出微弱底噪（防远端静音门限）"))?;
             AppendMenuW(m, MF_STRING, ID_OPEN_DIR, w!("打开配置文件夹"))?;
             AppendMenuW(m, MF_SEPARATOR, 0, None)?;
             AppendMenuW(m, MF_STRING, ID_EXIT, w!("退出"))?;
@@ -334,6 +337,15 @@ fn on_command(hwnd: HWND, cmd: usize) {
             with_app(|a| {
                 a.cfg.select(None);
                 a.apply_selection();
+            });
+        }
+        ID_DITHER => {
+            with_app(|a| {
+                a.cfg.silence_dither = !a.cfg.silence_dither;
+                a.save();
+                if let Some(e) = &a.engine {
+                    e.set_dither(a.cfg.silence_dither);
+                }
             });
         }
         ID_OPEN_DIR => {
@@ -500,7 +512,7 @@ fn main() {
             taskbar_created,
             cfg,
         };
-        let (target, output, buffer_ms) = (target_of(&app.cfg), app.cfg.output.clone(), app.cfg.buffer_ms);
+        let (target, output, buffer_ms, dither) = (target_of(&app.cfg), app.cfg.output.clone(), app.cfg.buffer_ms, app.cfg.silence_dither);
         APP.with(|a| *a.borrow_mut() = Some(app));
         with_app(|a| {
             a.refresh_icon(true);
@@ -514,6 +526,7 @@ fn main() {
             events.lock().unwrap().push_back(ev);
             let _ = PostMessageW(Some(HWND(hwnd_raw as _)), WM_ENGINE, WPARAM(0), LPARAM(0));
         });
+        engine.set_dither(dither);
         with_app(|a| a.engine = Some(engine));
 
         let mut msg = MSG::default();

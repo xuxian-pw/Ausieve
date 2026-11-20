@@ -33,6 +33,25 @@ const CRITICAL_MS: u32 = 2;
 /// Fade-in after (re)starting playback, so audio never starts with a step.
 const FADE_MS: u32 = 3;
 
+/// Amplitude of the optional silence dither: 1.5 LSB of 16-bit audio. Float -> I16
+/// conversion truncates toward zero, so every sample becomes +-1 LSB (about -90 dBFS):
+/// never an exact digital zero, far below audibility.
+pub const DITHER_AMPLITUDE: f32 = 1.5 / 32767.0;
+
+/// Adds +-[`DITHER_AMPLITUDE`] (random sign per frame) to every sample of an interleaved
+/// buffer. All channels of a frame get the same sign, so a receiver that downmixes to
+/// mono by averaging doesn't get exact zeros either.
+pub fn add_dither(buf: &mut [f32], rng: &mut u32) {
+    for frame in buf.chunks_mut(CHANNELS) {
+        // xorshift32
+        *rng ^= *rng << 13;
+        *rng ^= *rng >> 17;
+        *rng ^= *rng << 5;
+        let d = if *rng & 1 == 0 { DITHER_AMPLITUDE } else { -DITHER_AMPLITUDE };
+        frame.iter_mut().for_each(|v| *v += d);
+    }
+}
+
 /// Interleaved-stereo FIFO between the capture thread (push) and the device (pull).
 #[derive(Debug)]
 pub struct Jitter {
@@ -157,6 +176,7 @@ pub struct Output {
     jitter: Arc<Mutex<Jitter>>,
     error: Arc<Mutex<Option<String>>>,
     stop: Arc<AtomicBool>,
+    dither: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     pub rate: u32,
     pub description: String,
@@ -171,7 +191,8 @@ impl Output {
         let (init_tx, init_rx) = mpsc::channel::<Result<(u32, String, Arc<Mutex<Jitter>>), String>>();
         let error = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
-        let (error2, stop2) = (error.clone(), stop.clone());
+        let dither = Arc::new(AtomicBool::new(false));
+        let (error2, stop2, dither2) = (error.clone(), stop.clone(), dither.clone());
         let thread = std::thread::spawn(move || {
             let r = (|| -> Result<ExclusiveRender, String> {
                 wasapi::init_com().map_err(|e| e.to_string())?;
@@ -207,6 +228,7 @@ impl Output {
             let _ = init_tx.send(Ok((rate, desc, jitter.clone())));
             let _timer = wasapi::HighResTimer::new();
             let mut chunk = Vec::new();
+            let mut rng: u32 = 0x9E37_79B9;
             while !stop2.load(Ordering::Relaxed) {
                 // Keep the device buffer topped up to FILL_MS whenever it drops below
                 // LOW_WATER_MS. The device buffer itself is DEVICE_BUFFER_MS long, so a late
@@ -224,6 +246,9 @@ impl Output {
                     // real audio (a late capture packet is about to arrive); pad with
                     // silence only when the device is about to run dry.
                     let n = jitter.lock().unwrap().pull_upto(&mut chunk, pad < critical);
+                    if dither2.load(Ordering::Relaxed) {
+                        add_dither(&mut chunk[..n * CHANNELS], &mut rng);
+                    }
                     if let Err(e) = out.write(&chunk[..n * CHANNELS]) {
                         *error2.lock().unwrap() = Some(format!("output {name:?} failed: {e}"));
                         return;
@@ -234,7 +259,7 @@ impl Output {
         });
         match init_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok((rate, description, jitter))) => {
-                Ok(Output { jitter, error, stop, thread: Some(thread), rate, description })
+                Ok(Output { jitter, error, stop, dither, thread: Some(thread), rate, description })
             }
             Ok(Err(e)) => {
                 let _ = thread.join();
@@ -249,6 +274,14 @@ impl Output {
 
     pub fn push(&self, interleaved: &[f32]) {
         self.jitter.lock().unwrap().push(interleaved);
+    }
+
+    /// Silence dither: when on, a faint +-1 LSB noise (about -90 dBFS) is added to
+    /// everything written, so the device never carries exact digital zeros. Some
+    /// consumers (e.g. RustDesk's audio encoder) stop after a run of all-zero frames and
+    /// restart when sound returns; this keeps them running. Takes effect immediately.
+    pub fn set_dither(&self, on: bool) {
+        self.dither.store(on, Ordering::Relaxed);
     }
 
     /// Set once the output thread has failed (device removed, etc.).
@@ -324,6 +357,19 @@ mod tests {
         assert_eq!(j.underruns, 0);
         assert_eq!(j.pull_upto(&mut out, false), 0);
         assert_eq!(j.underruns, 0, "an empty queue is not an underrun while the device has slack");
+    }
+
+    #[test]
+    fn dither_is_never_zero_after_i16_truncation_and_stays_below_minus_80_db() {
+        let mut buf = vec![0.0f32; 48_000 * CHANNELS];
+        let mut rng = 1;
+        add_dither(&mut buf, &mut rng);
+        let ints: Vec<i16> = buf.iter().map(|v| (v * 32767.0) as i16).collect();
+        assert!(ints.iter().all(|&i| i == 1 || i == -1), "every sample +-1 LSB");
+        let pos = ints.iter().filter(|&&i| i > 0).count();
+        assert!((20_000..76_000).contains(&pos), "random sign, roughly balanced: {pos}");
+        let rms = (buf.iter().map(|v| v * v).sum::<f32>() / buf.len() as f32).sqrt();
+        assert!(20.0 * rms.log10() < -80.0);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! capture [--exclude-name Discord.exe | --exclude-path C:\...\Discord.exe | --exclude-pid 1234]
-//!         [--output "Line 1 (Virtual Audio Cable)"] [--buffer-ms 15]
+//!         [--output "Line 1 (Virtual Audio Cable)"] [--buffer-ms 15] [--silence-dither]
 //! capture --list-devices
 //! ```
 //!
@@ -23,13 +23,14 @@ struct Args {
     target: Target,
     output: String,
     buffer_ms: u32,
+    dither: bool,
 }
 
-const USAGE: &str = "usage: capture [--exclude-name NAME.exe | --exclude-path PATH | --exclude-pid PID] [--output DEVICE] [--buffer-ms N]\n       capture --list-devices";
+const USAGE: &str = "usage: capture [--exclude-name NAME.exe | --exclude-path PATH | --exclude-pid PID] [--output DEVICE] [--buffer-ms N] [--silence-dither]\n       capture --list-devices";
 
 fn parse() -> Result<Option<Args>, String> {
     let mut it = std::env::args().skip(1);
-    let mut a = Args { target: Target::None, output: DEFAULT_OUTPUT.into(), buffer_ms: DEFAULT_BUFFER_MS };
+    let mut a = Args { target: Target::None, output: DEFAULT_OUTPUT.into(), buffer_ms: DEFAULT_BUFFER_MS, dither: false };
     while let Some(s) = it.next() {
         match s.as_str() {
             "--exclude-name" => a.target = Target::Name(it.next().ok_or("--exclude-name needs a value")?),
@@ -43,6 +44,7 @@ fn parse() -> Result<Option<Args>, String> {
             "--buffer-ms" => {
                 a.buffer_ms = it.next().and_then(|v| v.parse().ok()).ok_or("--buffer-ms needs a number")?
             }
+            "--silence-dither" => a.dither = true,
             "--list-devices" => {
                 list_devices();
                 return Ok(None);
@@ -80,7 +82,7 @@ fn main() -> ExitCode {
     let mut ready = false;
     // The CLI keeps its original fail-fast behaviour: an output error ends the process
     // (the tray app instead lets the engine retry).
-    let _engine = Engine::start_with(args.target, args.output, args.buffer_ms, move |ev| match ev {
+    let engine = Engine::start_with(args.target, args.output, args.buffer_ms, move |ev| match ev {
         Event::Output(Ok(desc)) => eprintln!("capture: output {desc}"),
         Event::Output(Err(e)) | Event::CaptureError(e) => {
             eprintln!("capture: {e}");
@@ -95,6 +97,7 @@ fn main() -> ExitCode {
             }
         }
     });
+    engine.set_dither(args.dither);
     loop {
         std::thread::park();
     }
