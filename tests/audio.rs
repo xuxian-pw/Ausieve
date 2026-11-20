@@ -59,7 +59,35 @@ fn tone_device() -> Option<String> {
 
 fn serial() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    static WARM: OnceLock<()> = OnceLock::new();
+    let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    WARM.get_or_init(warm_up);
+    g
+}
+
+/// Some security software (seen with ESET) plays an alert sound on the default output
+/// the first time a new executable opens a recording device. Process loopback captures
+/// that sound into every measurement. So, once per test process: open the cable's
+/// recording side, then wait until the whole system output has been silent for 0.5 s
+/// (at most 10 s) before any test starts.
+fn warm_up() {
+    drop(record(Source::Cable, 200).join());
+    let t0 = Instant::now();
+    let mut quiet_since: Option<Instant> = None;
+    while t0.elapsed() < Duration::from_secs(10) {
+        let r = record(Source::ProcessLoopback(std::process::id()), 250).join().unwrap();
+        if audio_exclude::dsp::rms_db(&r.samples) < -90.0 {
+            let q = *quiet_since.get_or_insert_with(Instant::now);
+            if q.elapsed() >= Duration::from_millis(500) {
+                break;
+            }
+        } else {
+            quiet_since = None;
+        }
+    }
+    if t0.elapsed() > Duration::from_millis(1500) {
+        println!("[warm-up] waited {:?} for other system sounds to stop", t0.elapsed());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -895,4 +923,91 @@ fn diag_loopback_vs_other_streams() {
     let (ev, floor) = sine_glitches(&samples[onset..], F_EXCLUDED, 0.005);
     println!("[diag c: loopback while another stream starts/stops] marks {marks:?} | {} events {:?} floor {floor:.1} dB", ev.len(), &ev[..ev.len().min(10)]);
     drop(other);
+}
+
+/// Diagnostic (ignored): does opening a capture device make some other program (e.g. an
+/// antivirus microphone alert) play a sound? No test tone plays; the raw process
+/// loopback is watched while the cable's recording side is opened at ~1 s by this
+/// process and at ~3 s by a fresh child process.
+#[test]
+#[ignore]
+fn diag_sound_on_capture_open() {
+    let _g = serial();
+    let dummy = start_dummy();
+    let raw = record(Source::ProcessLoopback(dummy.pid()), 6000);
+    let local = record(Source::Local, 6000);
+    thread::sleep(Duration::from_millis(1000));
+    let c1 = record(Source::Cable, 500);
+    thread::sleep(Duration::from_millis(2000));
+    // a new process opening a capture device: capture.exe itself only opens loopback, so
+    // use a second copy of this test binary? Simpler: capture.exe (process loopback).
+    let pid = dummy.pid().to_string();
+    let cap = start_capture(&["--exclude-pid", &pid]);
+    let (raw, local) = (raw.join().unwrap(), local.join().unwrap());
+    drop(c1.join());
+    drop(cap);
+    let env = |r: &Recording| -> String {
+        r.samples.chunks(RATE as usize / 10).map(|c| format!("{:.0}", audio_exclude::dsp::rms_db(c))).collect::<Vec<_>>().join(" ")
+    };
+    println!("[diag alert] raw loopback 100 ms RMS: {}", env(&raw));
+    println!("[diag alert] local output 100 ms RMS: {}", env(&local));
+}
+
+/// Cable glitches that the raw process-loopback reference does not explain (cable on the
+/// raw recording's timeline; a reference step 0..60 ms earlier explains a cable glitch).
+/// Returns (unexplained glitch times in ms, report line).
+fn unexplained_glitches(cable: &Recording, raw: &Recording, freq: f32) -> (Vec<f32>, String) {
+    let thresh = 0.005;
+    let cable_al = align_to(cable, raw);
+    let onset = cable_al.iter().position(|v| v.abs() > 0.01).expect("sine never reached the cable");
+    let raw_onset = raw.samples.iter().position(|v| v.abs() > 0.01).expect("sine never reached process loopback");
+    // Only judge the cable while the source is still playing: the sine's own (abrupt)
+    // end is not a glitch, and the reference may miss its last packet.
+    let raw_end = raw.samples.iter().rposition(|v| v.abs() > 0.01).unwrap_or(raw.samples.len());
+    let cable_end = (raw_end.saturating_sub(RATE as usize / 200)).clamp(onset, cable_al.len());
+    let ms = |i: usize| i as f32 * 1000.0 / RATE;
+    let (rg, rfloor) = sine_glitches(&raw.samples[raw_onset..raw_end], freq, thresh);
+    let rg: Vec<f32> = rg.iter().filter(|&&t| t > 2.0).map(|t| t + ms(raw_onset)).collect();
+    let (cg, cfloor) = sine_glitches(&cable_al[onset..cable_end], freq, thresh);
+    let cg: Vec<f32> = cg.iter().filter(|&&t| t > 2.0).map(|t| t + ms(onset)).collect();
+    let ours: Vec<f32> = cg.iter().cloned().filter(|&t| !rg.iter().any(|&r| r <= t + 5.0 && r >= t - 60.0)).collect();
+    let first = cable_al[onset..].iter().take(RATE as usize / 1000).fold(0.0f32, |m, v| m.max(v.abs()));
+    let report = format!(
+        "raw loopback: {} steps, floor {rfloor:.1} dB | cable: starts {:.1} ms after raw loopback, peak in its first 1 ms {first:.3} (sine amplitude 0.1), {} events {:?}, floor {cfloor:.1} dB | unexplained: {} {:?}",
+        rg.len(),
+        ms(onset) - ms(raw_onset),
+        cg.len(),
+        &cg[..cg.len().min(8)],
+        ours.len(),
+        &ours[..ours.len().min(8)]
+    );
+    (ours, report)
+}
+
+/// 11. Silence -> sound, like the volume-preview "ding": capture has been running while
+/// nothing played for 5 s (process loopback idles and delivers no packets), then a
+/// sine starts. The cable must carry it without glitches from the first sample on.
+#[test]
+fn t11_sound_after_silence() {
+    let _g = serial();
+    let dummy = start_dummy();
+    let pid = dummy.pid().to_string();
+    let _cap = start_capture(&["--exclude-pid", &pid]);
+    for attempt in 1..=3 {
+        thread::sleep(Duration::from_secs(5)); // nothing plays: loopback goes idle
+        let cable = record(Source::Cable, 2500);
+        let raw = record(Source::ProcessLoopback(dummy.pid()), 2500);
+        thread::sleep(Duration::from_millis(200));
+        let _t = start_tone(&tone_exe(), F_EXCLUDED, &["--duration", "1800"]);
+        let (cable, raw) = (cable.join().unwrap(), raw.join().unwrap());
+        if cable.gaps > 0 {
+            println!("[t11] attempt {attempt}: cable recorder had gaps; measurement discarded");
+            continue;
+        }
+        let (ours, report) = unexplained_glitches(&cable, &raw, F_EXCLUDED);
+        println!("[t11 silence -> sound] {report}");
+        assert!(ours.is_empty(), "{} glitches in the cable after silence -> sound: {ours:?}", ours.len());
+        return;
+    }
+    panic!("no valid measurement in 3 attempts");
 }
