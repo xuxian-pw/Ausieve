@@ -486,3 +486,39 @@ fn t6_latency() {
     println!("[t6 latency] median {median:.1} ms, all {results:?} (threshold {max_ms} ms)");
     assert!(median < max_ms, "end-to-end latency {median:.1} ms >= {max_ms} ms");
 }
+
+/// Copies tone.exe to `<tmp>/<dir>/same_name.exe`.
+fn same_name_copy(dir: &str) -> PathBuf {
+    let d = Path::new(env!("CARGO_TARGET_TMPDIR")).join(dir);
+    std::fs::create_dir_all(&d).unwrap();
+    let dst = d.join("same_name.exe");
+    if let Err(e) = std::fs::copy(tone_exe(), &dst) {
+        assert!(dst.exists(), "copy tone.exe -> {dst:?}: {e}");
+    }
+    dst
+}
+
+/// 7. Exclusion by full path: two programs with the same file name in different folders;
+/// only the one whose path is given is excluded (by-name matching could not tell them
+/// apart). Then the excluded program restarts and is still excluded.
+#[test]
+fn t7_exclusion_by_path() {
+    let _g = serial();
+    let excluded = same_name_copy("path_a");
+    let kept = same_name_copy("path_b");
+    let a = start_tone(&excluded, F_EXCLUDED, &["--duration", "15000"]);
+    let _b = start_tone(&kept, F_KEPT, &["--duration", "15000"]);
+    let path = excluded.to_str().unwrap();
+    let mut cap = start_capture(&["--exclude-path", path]);
+    cap.wait_target(a.pid(), Duration::from_secs(1));
+    thread::sleep(Duration::from_millis(300));
+    assert_excluded("t7 exclude path");
+
+    let old = a.pid();
+    drop(a);
+    let a2 = start_tone(&excluded, F_EXCLUDED, &["--duration", "15000"]);
+    cap.wait_target(a2.pid(), Duration::from_secs(3));
+    println!("[t7] re-targeted {old} -> {} after restart", a2.pid());
+    thread::sleep(Duration::from_millis(300));
+    assert_excluded("t7 after restart");
+}

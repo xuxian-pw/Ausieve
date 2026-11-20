@@ -2,7 +2,8 @@
 //! (by default the playback side of "Line 1 (Virtual Audio Cable)").
 //!
 //! ```text
-//! capture [--exclude-name Discord.exe | --exclude-pid 1234] [--output "Line 1 (Virtual Audio Cable)"]
+//! capture [--exclude-name Discord.exe | --exclude-path C:\...\Discord.exe | --exclude-pid 1234]
+//!         [--output "Line 1 (Virtual Audio Cable)"]
 //! capture --list-devices
 //! ```
 //!
@@ -11,28 +12,19 @@
 //! * `READY`         first stream is running
 
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
 
-use audio_exclude::procs;
-use audio_exclude::wasapi::{self, CaptureStream, ExclusiveRender, CHANNELS};
+use audio_exclude::engine::{Engine, Event, Target};
+use audio_exclude::wasapi;
 use windows::Win32::Media::Audio::{eCapture, eRender};
 
 const DEFAULT_OUTPUT: &str = "Line 1 (Virtual Audio Cable)";
-/// Never let more than this much audio queue up in the output buffer (latency cap).
-const MAX_QUEUE_MS: u32 = 30;
-
-enum Target {
-    None,
-    Pid(u32),
-    Name(String),
-}
 
 struct Args {
     target: Target,
     output: String,
 }
 
-const USAGE: &str = "usage: capture [--exclude-name NAME.exe | --exclude-pid PID] [--output DEVICE]\n       capture --list-devices";
+const USAGE: &str = "usage: capture [--exclude-name NAME.exe | --exclude-path PATH | --exclude-pid PID] [--output DEVICE]\n       capture --list-devices";
 
 fn parse() -> Result<Option<Args>, String> {
     let mut it = std::env::args().skip(1);
@@ -40,6 +32,7 @@ fn parse() -> Result<Option<Args>, String> {
     while let Some(s) = it.next() {
         match s.as_str() {
             "--exclude-name" => a.target = Target::Name(it.next().ok_or("--exclude-name needs a value")?),
+            "--exclude-path" => a.target = Target::Path(it.next().ok_or("--exclude-path needs a value")?),
             "--exclude-pid" => {
                 a.target = Target::Pid(
                     it.next().and_then(|v| v.parse().ok()).ok_or("--exclude-pid needs a number")?,
@@ -80,95 +73,25 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match run(args) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
+    let mut ready = false;
+    // The CLI keeps its original fail-fast behaviour: an output error ends the process
+    // (the tray app instead lets the engine retry).
+    let _engine = Engine::start(args.target, args.output, move |ev| match ev {
+        Event::Output(Ok(desc)) => eprintln!("capture: output {desc}"),
+        Event::Output(Err(e)) | Event::CaptureError(e) => {
             eprintln!("capture: {e}");
-            ExitCode::FAILURE
+            std::process::exit(1);
         }
-    }
-}
-
-/// Which PID to exclude right now. `None` = nothing to exclude.
-fn resolve(t: &Target) -> Option<u32> {
-    match t {
-        Target::None => None,
-        Target::Pid(p) => Some(*p),
-        Target::Name(n) => procs::find_root(n),
-    }
-}
-
-fn open_loopback(target: Option<u32>, rate: u32) -> Result<CaptureStream, String> {
-    // EXCLUDE mode needs some PID; with nothing to exclude we exclude ourselves, which
-    // removes nothing (our only output is an exclusive stream that loopback can't see).
-    let pid = target.unwrap_or_else(std::process::id);
-    let s = CaptureStream::process_loopback(pid, false, 20, rate)
-        .map_err(|e| format!("process loopback activation (pid {pid}) failed: {e}"))?;
-    match target {
-        Some(p) => println!("TARGET {p}"),
-        None => println!("TARGET none"),
-    }
-    Ok(s)
-}
-
-fn run(args: Args) -> Result<(), String> {
-    wasapi::init_com().map_err(|e| format!("CoInitializeEx: {e}"))?;
-    let out_dev = wasapi::find_device(&args.output, eRender)?;
-    // Exclusive mode is essential, see ExclusiveRender: a shared-mode stream into the
-    // cable would be captured by our own process loopback and recirculate.
-    let mut out = ExclusiveRender::open(&out_dev, 40).map_err(|e| format!("open output {:?}: {e}", args.output))?;
-    let rate = out.rate;
-    eprintln!(
-        "capture: output {:?} exclusive {} Hz {:?}, buffer {} frames",
-        args.output, rate, out.kind, out.buffer_frames
-    );
-    let max_queue = (rate * MAX_QUEUE_MS / 1000).min(out.buffer_frames);
-    // Pre-fill a little silence so the first packets don't underrun.
-    let silence = vec![0.0f32; (rate as usize / 200) * CHANNELS];
-    out.write(&silence).map_err(|e| format!("output write: {e}"))?;
-    out.start().map_err(|e| format!("start output: {e}"))?;
-
-    let mut target = resolve(&args.target);
-    let mut cap = open_loopback(target, rate)?;
-    println!("READY");
-
-    let mut last_check = Instant::now();
+        Event::Target(Some(p)) => println!("TARGET {p}"),
+        Event::Target(None) => println!("TARGET none"),
+        Event::Running => {
+            if !ready {
+                ready = true;
+                println!("READY");
+            }
+        }
+    });
     loop {
-        if cap.wait(Duration::from_millis(50)) {
-            let mut err = None;
-            cap.read(|p| {
-                let mut data = p.samples;
-                let frames = data.len() / CHANNELS;
-                match out.padding() {
-                    Ok(pad) => {
-                        // Drop the oldest part of the packet if the queue would exceed the cap
-                        // (clock drift between the loopback and output device).
-                        let over = (pad as usize + frames).saturating_sub(max_queue as usize);
-                        if over > 0 {
-                            let skip = over.min(frames);
-                            data = &data[skip * CHANNELS..];
-                        }
-                        if let Err(e) = out.write(data) {
-                            err = Some(e);
-                        }
-                    }
-                    Err(e) => err = Some(e),
-                }
-            })
-            .map_err(|e| format!("capture read: {e}"))?;
-            if let Some(e) = err {
-                return Err(format!("output write: {e}"));
-            }
-        }
-
-        if matches!(args.target, Target::Name(_)) && last_check.elapsed() > Duration::from_millis(250) {
-            last_check = Instant::now();
-            let now = resolve(&args.target);
-            if now != target {
-                drop(cap);
-                target = now;
-                cap = open_loopback(target, rate)?;
-            }
-        }
+        std::thread::park();
     }
 }
