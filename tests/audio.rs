@@ -323,6 +323,42 @@ fn envelope(x: &[f32], win: usize, freq: f32) -> Vec<f32> {
 // tests
 // ---------------------------------------------------------------------------
 
+/// 1. Exclusion works: with A (1000 Hz) excluded by PID, the cable carries B (440 Hz)
+/// and A is ≥40 dB below it.
+#[test]
+fn t1_exclusion_by_pid() {
+    let _g = serial();
+    let a = start_tone(&excluded_exe(), F_EXCLUDED, &["--duration", "8000"]);
+    let _b = start_tone(&tone_exe(), F_KEPT, &["--duration", "8000"]);
+    let pid = a.pid().to_string();
+    let mut cap = start_capture(&["--exclude-pid", &pid]);
+    cap.wait_target(a.pid(), Duration::from_secs(1));
+    // first test after a build: give the freshly opened exclusive stream time to settle
+    thread::sleep(Duration::from_millis(600));
+    assert_excluded("t1 exclude pid");
+}
+
+/// 2. Control: excluding an unrelated silent process, both tones reach the cable.
+#[test]
+fn t2_control_nothing_excluded() {
+    let _g = serial();
+    let dummy = start_dummy();
+    let _a = start_tone(&excluded_exe(), F_EXCLUDED, &["--duration", "8000"]);
+    let _b = start_tone(&tone_exe(), F_KEPT, &["--duration", "8000"]);
+    let pid = dummy.pid().to_string();
+    let _cap = start_capture(&["--exclude-pid", &pid]);
+    thread::sleep(Duration::from_millis(300));
+    let (cable, local) = record_both(1000);
+    let (cable, local) = (cable.join().unwrap(), local.join().unwrap());
+    let (k, x) = levels(&cable);
+    let (lk, lx) = levels(&local);
+    println!("[t2 control] cable: {F_KEPT} Hz {k:.1} dB, {F_EXCLUDED} Hz {x:.1} dB | local: {lk:.1} dB, {lx:.1} dB");
+    assert!(k > PRESENT_DB, "440 Hz missing from cable ({k:.1} dB)");
+    assert!(x > PRESENT_DB, "1000 Hz missing from cable although nothing relevant is excluded ({x:.1} dB)");
+    // the cable should carry the same levels the user hears (unity gain path)
+    assert!((k - lk).abs() < 3.0 && (x - lx).abs() < 3.0, "cable level differs from local output by >3 dB");
+}
+
 /// 3. No feedback loop: capture must not re-capture its own output into the cable.
 ///
 /// B plays a 200 ms burst. A loop would make the cable louder than the local output and
@@ -378,3 +414,75 @@ fn t3_no_feedback_loop() {
     );
 }
 
+/// 4. Process restart: excluded by *name*, A is killed and restarted (new PID) and is
+/// still excluded.
+#[test]
+fn t4_exclusion_survives_restart() {
+    let _g = serial();
+    let a1 = start_tone(&excluded_exe(), F_EXCLUDED, &["--duration", "15000"]);
+    let _b = start_tone(&tone_exe(), F_KEPT, &["--duration", "15000"]);
+    let mut cap = start_capture(&["--exclude-name", EXCLUDED_NAME]);
+    cap.wait_target(a1.pid(), Duration::from_secs(1));
+    thread::sleep(Duration::from_millis(300));
+    assert_excluded("t4 before restart");
+
+    let old = a1.pid();
+    drop(a1); // kill
+    let a2 = start_tone(&excluded_exe(), F_EXCLUDED, &["--duration", "15000"]);
+    assert_ne!(old, a2.pid());
+    let t = Instant::now();
+    cap.wait_target(a2.pid(), Duration::from_secs(3));
+    println!("[t4] capture re-targeted {old} -> {} after {:?}", a2.pid(), t.elapsed());
+    thread::sleep(Duration::from_millis(300));
+    assert_excluded("t4 after restart");
+}
+
+/// 5. Child process plays: A only spawns a child that makes the sound; excluding A's
+/// (root) process tree by name still removes it.
+#[test]
+fn t5_exclusion_covers_child_process() {
+    let _g = serial();
+    let a = start_tone(&excluded_exe(), F_EXCLUDED, &["--spawn-child", "--duration", "8000"]);
+    let child: u32 = a
+        .seen
+        .iter()
+        .find_map(|l| l.strip_prefix("CHILD "))
+        .and_then(|s| s.trim().parse().ok())
+        .expect("no CHILD line");
+    let player: u32 = a.seen.last().and_then(|l| l.strip_prefix("PLAYING ")).unwrap().trim().parse().unwrap();
+    assert_eq!(player, child, "the child, not the parent, must be the one playing");
+    let _b = start_tone(&tone_exe(), F_KEPT, &["--duration", "8000"]);
+    let mut cap = start_capture(&["--exclude-name", EXCLUDED_NAME]);
+    cap.wait_target(a.pid(), Duration::from_secs(1));
+    println!("[t5] root {} (silent) -> child {child} (playing); capture excludes root", a.pid());
+    thread::sleep(Duration::from_millis(300));
+    assert_excluded("t5 child process");
+}
+
+/// 6. Latency: a 30 ms burst is cross-correlated between the local output and the cable
+/// (both on the QPC clock). Reports the added end-to-end latency of capture.
+#[test]
+fn t6_latency() {
+    let _g = serial();
+    let max_ms: f32 = std::env::var("AUDIO_EXCLUDE_MAX_LATENCY_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(50.0);
+    let dummy = start_dummy();
+    let pid = dummy.pid().to_string();
+    let _cap = start_capture(&["--exclude-pid", &pid]);
+    thread::sleep(Duration::from_millis(300));
+    let mut results = Vec::new();
+    for round in 0..3 {
+        let (cable, local) = record_both(1800);
+        let _b = start_tone(&tone_exe(), F_EXCLUDED, &["--delay", "500", "--burst", "30", "--duration", "1500"]);
+        let (cable, local) = (cable.join().unwrap(), local.join().unwrap());
+        let cable_al = align_to(&cable, &local);
+        let (lag, coef) = xcorr_lag(&local.samples, &cable_al, (RATE * 0.3) as usize);
+        let ms = lag as f32 * 1000.0 / RATE;
+        println!("[t6 latency] round {round}: {ms:.1} ms (correlation {coef:.2})");
+        assert!(coef > 0.5, "burst not found in cable (correlation {coef:.2})");
+        results.push(ms);
+    }
+    results.sort_by(f32::total_cmp);
+    let median = results[1];
+    println!("[t6 latency] median {median:.1} ms, all {results:?} (threshold {max_ms} ms)");
+    assert!(median < max_ms, "end-to-end latency {median:.1} ms >= {max_ms} ms");
+}
