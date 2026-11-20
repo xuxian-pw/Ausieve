@@ -953,6 +953,82 @@ fn diag_sound_on_capture_open() {
     println!("[diag alert] local output 100 ms RMS: {}", env(&local));
 }
 
+/// Diagnostic (ignored): the real volume-preview "ding" (the `.Default` system sound,
+/// `AUDIO_EXCLUDE_DING` or `C:\Windows\Media\Windows Background.wav`) after 5 s of
+/// silence. Records the cable and the raw process loopback, aligns them sample-exactly
+/// and reports peaks, clipped samples, the cable-minus-reference residual, and whether
+/// the cable carries exact digital zeros while nothing plays.
+#[test]
+#[ignore]
+fn diag_ding() {
+    let _g = serial();
+    let wav = std::env::var("AUDIO_EXCLUDE_DING").unwrap_or_else(|_| r"C:\Windows\Media\Windows Background.wav".into());
+    let dummy = start_dummy();
+    let pid = dummy.pid().to_string();
+    // AUDIO_EXCLUDE_USE_RUNNING=1: measure an already running capture/tray instead
+    let cap = std::env::var_os("AUDIO_EXCLUDE_USE_RUNNING").is_none().then(|| start_capture(&["--exclude-pid", &pid]));
+    for round in 1..=3 {
+        thread::sleep(Duration::from_secs(5));
+        let cable = record(Source::Cable, 4500);
+        let raw = record(Source::ProcessLoopback(dummy.pid()), 4500);
+        thread::sleep(Duration::from_millis(1000));
+        let mut ps = Command::new("powershell");
+        ps.args(["-NoProfile", "-Command", &format!("(New-Object Media.SoundPlayer '{wav}').PlaySync()")]);
+        let st = ps.status().unwrap();
+        assert!(st.success());
+        let (cable, raw) = (cable.join().unwrap(), raw.join().unwrap());
+        let cable_al = align_to(&cable, &raw);
+        // silence before the ding: exact zeros?
+        let pre = &cable_al[..(RATE as usize * 8 / 10).min(cable_al.len())];
+        let pre_nonzero = pre.iter().filter(|v| **v != 0.0).count();
+        let pre_max = pre.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let peak = |x: &[f32]| x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let clipped = |x: &[f32]| x.iter().filter(|v| v.abs() >= 0.9999).count();
+        // refine alignment by cross-correlation around the ding
+        let Some(r_on) = raw.samples.iter().position(|v| v.abs() > 0.001) else {
+            println!("[diag ding {round}] ding not in process loopback");
+            continue;
+        };
+        let Some(c_on) = cable_al.iter().position(|v| v.abs() > 0.001) else {
+            println!("[diag ding {round}] ding not in cable");
+            continue;
+        };
+        let start = r_on.saturating_sub(480);
+        let n = (RATE as usize * 2).min(raw.samples.len() - start);
+        let reference = &raw.samples[start..start + n];
+        let delayed = &cable_al[start..(start + n + 9600).min(cable_al.len())];
+        let (lag, corr) = xcorr_lag(reference, delayed, 4800);
+        let m = n.min(delayed.len() - lag);
+        let (num, den) = (0..m).fold((0.0f64, 0.0f64), |(a, b), i| (a + (delayed[i + lag] * reference[i]) as f64, b + (reference[i] * reference[i]) as f64));
+        let gain = (num / den) as f32;
+        let res: Vec<f32> = (0..m).map(|i| delayed[i + lag] - gain * reference[i]).collect();
+        let sig_rms = audio_exclude::dsp::rms_db(&reference[..m]);
+        let res_rms = audio_exclude::dsp::rms_db(&res);
+        let res_peak = peak(&res);
+        // where is the residual largest (10 ms blocks above -60 dB)
+        let bad: Vec<String> = res
+            .chunks(480)
+            .enumerate()
+            .filter(|(_, c)| audio_exclude::dsp::rms_db(c) > -60.0)
+            .map(|(i, c)| format!("{}ms:{:.0}", i * 10, audio_exclude::dsp::rms_db(c)))
+            .take(12)
+            .collect();
+        println!(
+            "[diag ding {round}] silence before: {pre_nonzero} non-zero samples (max {pre_max:e}) | raw peak {:.4} ({:.1} dBFS), clipped {} | cable peak {:.4}, clipped {} | lag {:.2} ms (cable after raw {:.1} ms), corr {corr:.5}, gain {gain:.4} | signal {sig_rms:.1} dB, residual {res_rms:.1} dB (peak {res_peak:.4}), loud residual blocks {bad:?} | recorder gaps cable {} raw {}",
+            peak(&raw.samples),
+            audio_exclude::dsp::to_db(peak(&raw.samples)),
+            clipped(&raw.samples),
+            peak(&cable_al),
+            clipped(&cable_al),
+            lag as f32 * 1000.0 / RATE,
+            (c_on as f32 - r_on as f32) * 1000.0 / RATE,
+            cable.gaps,
+            raw.gaps
+        );
+    }
+    drop(cap);
+}
+
 /// Cable glitches that the raw process-loopback reference does not explain (cable on the
 /// raw recording's timeline; a reference step 0..60 ms earlier explains a cable glitch).
 /// Returns (unexplained glitch times in ms, report line).
