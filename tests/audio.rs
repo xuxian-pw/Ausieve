@@ -34,7 +34,9 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use audio_exclude::config::Config;
 use audio_exclude::dsp::tone_level_db;
+use audio_exclude::engine::{Engine, Event, Target};
 use audio_exclude::wasapi::{self, CaptureStream, CHANNELS, SAMPLE_RATE};
 use rustfft::{num_complex::Complex, FftPlanner};
 use windows::Win32::Media::Audio::{eCapture, eRender};
@@ -73,11 +75,16 @@ struct Proc {
 
 impl Proc {
     fn spawn(exe: &Path, args: &[&str]) -> Proc {
-        let mut child = Command::new(exe)
-            .args(args)
+        let mut cmd = Command::new(exe);
+        cmd.args(args);
+        Proc::spawn_cmd(cmd)
+    }
+
+    fn spawn_cmd(mut cmd: Command) -> Proc {
+        let mut child = cmd
             .stdout(Stdio::piped())
             .spawn()
-            .unwrap_or_else(|e| panic!("spawn {exe:?}: {e}"));
+            .unwrap_or_else(|e| panic!("spawn {cmd:?}: {e}"));
         let out = child.stdout.take().unwrap();
         let (tx, lines) = mpsc::channel();
         thread::spawn(move || {
@@ -521,4 +528,159 @@ fn t7_exclusion_by_path() {
     println!("[t7] re-targeted {old} -> {} after restart", a2.pid());
     thread::sleep(Duration::from_millis(300));
     assert_excluded("t7 after restart");
+}
+
+// ---------------------------------------------------------------------------
+// tray app
+// ---------------------------------------------------------------------------
+
+mod tray_win {
+    use windows::core::w;
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_CLOSE, WM_COMMAND};
+
+    /// The tray's hidden top-level window.
+    pub fn find() -> Option<HWND> {
+        unsafe { FindWindowW(w!("audio-exclude-tray"), None).ok() }
+    }
+    /// Same command IDs as the tray menu (see src/bin/tray.rs).
+    pub const ID_NONE: usize = 1;
+    pub const ID_PROGRAM: usize = 1000;
+    pub fn command(h: HWND, id: usize) {
+        unsafe { PostMessageW(Some(h), WM_COMMAND, WPARAM(id), LPARAM(0)).unwrap() }
+    }
+    /// Simulates a right click on the tray icon (opens the real popup menu), then
+    /// cancels the menu. Exercises menu construction; the click itself is not automated.
+    pub fn open_and_cancel_menu(h: HWND) {
+        const WM_TRAY: u32 = 0x8000 + 1; // WM_APP + 1, see tray.rs
+        const WM_RBUTTONUP: isize = 0x0205;
+        const WM_CANCELMODE: u32 = 0x001F;
+        unsafe {
+            PostMessageW(Some(h), WM_TRAY, WPARAM(0), LPARAM(WM_RBUTTONUP)).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            let _ = PostMessageW(Some(h), WM_CANCELMODE, WPARAM(0), LPARAM(0));
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+    pub fn close(h: HWND) {
+        unsafe {
+            let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+fn wait_config(path: &Path, want_selected: Option<&str>) -> Config {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let c = Config::load(path).unwrap();
+        if c.selected.as_deref() == want_selected || Instant::now() > deadline {
+            return c;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// 8. Tray app: restores a saved config on start (excludes the saved program by path),
+/// and switching the selection (same command IDs the menu sends) takes effect
+/// immediately and is written back to the config file. The menu itself and the file
+/// picker are not automated.
+#[test]
+fn t8_tray_restores_config_and_switches() {
+    let _g = serial();
+    assert!(tray_win::find().is_none(), "a tray instance is already running; quit it before running the tests");
+    let excluded = same_name_copy("tray_a");
+    let excluded_s = excluded.to_str().unwrap().to_string();
+    let cfg_path = Path::new(env!("CARGO_TARGET_TMPDIR")).join("tray_cfg").join("config.json");
+    let mut cfg = Config { output: cable_name(), ..Config::default() };
+    cfg.add_program(&excluded_s);
+    cfg.select(Some(&excluded_s));
+    cfg.save(&cfg_path).unwrap();
+
+    let a = start_tone(&excluded, F_EXCLUDED, &["--duration", "15000"]);
+    let _b = start_tone(&tone_exe(), F_KEPT, &["--duration", "15000"]);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tray"));
+    cmd.env("AUDIO_EXCLUDE_CONFIG", &cfg_path);
+    let mut tray = Proc::spawn_cmd(cmd);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let h = loop {
+        if let Some(h) = tray_win::find() {
+            break h;
+        }
+        assert!(Instant::now() < deadline, "tray window never appeared (exit: {:?})", tray.child.try_wait());
+        thread::sleep(Duration::from_millis(50));
+    };
+    thread::sleep(Duration::from_millis(1000));
+    assert_excluded("t8 restored from config");
+    tray_win::open_and_cancel_menu(h);
+    assert!(tray.child.try_wait().unwrap().is_none(), "tray exited while building/showing its menu");
+
+    tray_win::command(h, tray_win::ID_NONE);
+    assert_eq!(wait_config(&cfg_path, None).selected, None, "selection not saved");
+    thread::sleep(Duration::from_millis(500));
+    let (cable, _local) = record_both(1000);
+    let (k, x) = levels(&cable.join().unwrap());
+    println!("[t8 switched to none] cable: {F_KEPT} Hz {k:.1} dB, {F_EXCLUDED} Hz {x:.1} dB");
+    assert!(k > PRESENT_DB && x > PRESENT_DB, "after selecting 'exclude nothing' both tones must pass");
+
+    tray_win::command(h, tray_win::ID_PROGRAM);
+    let c = wait_config(&cfg_path, Some(&excluded_s));
+    assert_eq!(c.selected.as_deref(), Some(excluded_s.as_str()), "selection not saved");
+    thread::sleep(Duration::from_millis(500));
+    assert_excluded("t8 switched back");
+
+    tray_win::close(h);
+    let t = Instant::now();
+    while tray.child.try_wait().unwrap().is_none() && t.elapsed() < Duration::from_secs(5) {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(tray.child.try_wait().unwrap().is_some(), "tray did not exit on WM_CLOSE");
+    drop(a);
+}
+
+fn next_output_event(rx: &Receiver<Event>, timeout: Duration) -> Result<String, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(Event::Output(r)) => return r,
+            Ok(_) => {}
+            Err(_) => panic!("no output event within {timeout:?}"),
+        }
+    }
+}
+
+/// 9. Output errors don't end the engine: a missing device and a device held
+/// exclusively by another program are reported, and the engine recovers by itself once
+/// the device is free (this is what the tray turns into notifications).
+#[test]
+fn t9_engine_retries_output() {
+    let _g = serial();
+    let (tx, rx) = mpsc::channel();
+    // Not Target::None: that excludes the engine's own process tree, which here is the
+    // test process and therefore includes the tone helpers.
+    let dummy = start_dummy();
+    let engine = Engine::start(Target::Pid(dummy.pid()), "No Such Output Device 1234".into(), move |e| {
+        let _ = tx.send(e);
+    });
+    let e1 = next_output_event(&rx, Duration::from_secs(3)).unwrap_err();
+    println!("[t9] missing device -> {e1}");
+
+    let blocker = start_capture(&[]); // another process holds the cable exclusively
+    engine.set_output(cable_name());
+    let e2 = next_output_event(&rx, Duration::from_secs(3)).unwrap_err();
+    println!("[t9] device busy -> {e2}");
+    assert!(e2.contains("in use"), "expected an 'in use' error, got {e2}");
+
+    let freed = Instant::now();
+    drop(blocker);
+    let ok = next_output_event(&rx, Duration::from_secs(6)).expect("engine did not recover");
+    println!("[t9] recovered {:?} after the device was freed: {ok}", freed.elapsed());
+    thread::sleep(Duration::from_millis(300));
+    let _b = start_tone(&tone_exe(), F_KEPT, &["--duration", "3000"]);
+    thread::sleep(Duration::from_millis(200));
+    let (cable, _local) = record_both(800);
+    let (k, _) = levels(&cable.join().unwrap());
+    println!("[t9] audio after recovery: {F_KEPT} Hz {k:.1} dB");
+    assert!(k > PRESENT_DB, "no audio after recovery");
+    drop(engine);
 }
