@@ -38,6 +38,10 @@ const ID_OPEN_DIR: usize = 4;
 const ID_PROGRAM: usize = 1000; // + index
 const ID_REMOVE: usize = 2000; // + index
 const ID_OUTPUT: usize = 3000; // + index
+const ID_BUFFER: usize = 4000; // + index into BUFFER_CHOICES
+
+/// Jitter-buffer choices offered in the menu (ms).
+const BUFFER_CHOICES: [u32; 5] = [11, 12, 15, 20, 30];
 
 #[derive(Default)]
 struct Status {
@@ -236,6 +240,17 @@ impl App {
                 }
             }
             AppendMenuW(m, MF_POPUP, om.0 as usize, w!("输出设备"))?;
+
+            let bm = CreatePopupMenu()?;
+            AppendMenuW(bm, MF_STRING | MF_GRAYED, 0, w!("越小延迟越低，越大越不容易断音"))?;
+            for (i, &ms) in BUFFER_CHOICES.iter().enumerate() {
+                let text = if ms == audio_exclude::engine::DEFAULT_BUFFER_MS { format!("{ms} ms（默认）") } else { format!("{ms} ms") };
+                AppendMenuW(bm, MF_STRING, ID_BUFFER + i, &HSTRING::from(text))?;
+                if ms == self.cfg.buffer_ms {
+                    set_radio(bm, ID_BUFFER + i);
+                }
+            }
+            AppendMenuW(m, MF_POPUP, bm.0 as usize, &HSTRING::from(format!("缓冲 / 延迟（{} ms）", self.cfg.buffer_ms)))?;
             AppendMenuW(m, MF_STRING, ID_OPEN_DIR, w!("打开配置文件夹"))?;
             AppendMenuW(m, MF_SEPARATOR, 0, None)?;
             AppendMenuW(m, MF_STRING, ID_EXIT, w!("退出"))?;
@@ -347,7 +362,20 @@ fn on_command(hwnd: HWND, cmd: usize) {
                 }
             });
         }
-        c if c >= ID_OUTPUT => {
+        c if c >= ID_BUFFER => {
+            with_app(|a| {
+                if let Some(&ms) = BUFFER_CHOICES.get(c - ID_BUFFER) {
+                    if ms != a.cfg.buffer_ms {
+                        a.cfg.buffer_ms = ms;
+                        a.save();
+                        if let Some(e) = &a.engine {
+                            e.set_buffer_ms(ms);
+                        }
+                    }
+                }
+            });
+        }
+        c if (ID_OUTPUT..ID_BUFFER).contains(&c) => {
             with_app(|a| {
                 if let Some(n) = a.menu_outputs.get(c - ID_OUTPUT).cloned() {
                     if n != a.cfg.output {
@@ -472,7 +500,7 @@ fn main() {
             taskbar_created,
             cfg,
         };
-        let (target, output) = (target_of(&app.cfg), app.cfg.output.clone());
+        let (target, output, buffer_ms) = (target_of(&app.cfg), app.cfg.output.clone(), app.cfg.buffer_ms);
         APP.with(|a| *a.borrow_mut() = Some(app));
         with_app(|a| {
             a.refresh_icon(true);
@@ -482,7 +510,7 @@ fn main() {
         });
 
         let hwnd_raw = hwnd.0 as isize;
-        let engine = Engine::start(target, output, move |ev| {
+        let engine = Engine::start_with(target, output, buffer_ms, move |ev| {
             events.lock().unwrap().push_back(ev);
             let _ = PostMessageW(Some(HWND(hwnd_raw as _)), WM_ENGINE, WPARAM(0), LPARAM(0));
         });

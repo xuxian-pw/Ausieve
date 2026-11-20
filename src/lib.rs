@@ -8,5 +8,6 @@
 pub mod config;
 pub mod dsp;
 pub mod engine;
+pub mod output;
 pub mod procs;
 pub mod wasapi;

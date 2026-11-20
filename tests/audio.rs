@@ -189,7 +189,13 @@ fn start_capture(args: &[&str]) -> Proc {
     let cable = cable_name();
     let mut all: Vec<&str> = args.to_vec();
     all.extend(["--output", cable.as_str()]);
-    let mut p = Proc::spawn(Path::new(env!("CARGO_BIN_EXE_capture")), &all);
+    let buf = std::env::var("AUDIO_EXCLUDE_BUFFER_MS").unwrap_or_default();
+    if !buf.is_empty() {
+        all.extend(["--buffer-ms", buf.as_str()]);
+    }
+    // AUDIO_EXCLUDE_CAPTURE_EXE: run the tests against another build (A/B comparisons)
+    let exe = std::env::var_os("AUDIO_EXCLUDE_CAPTURE_EXE").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_capture")));
+    let mut p = Proc::spawn(&exe, &all);
     p.wait_line("READY", Duration::from_secs(5));
     p
 }
@@ -203,6 +209,9 @@ struct Recording {
     samples: Vec<f32>,
     /// QPC time (100 ns units) of `samples[0]`.
     start_qpc: u64,
+    /// Recorder-side gaps (>2 ms holes or DATA_DISCONTINUITY flags): if non-zero, a
+    /// glitch may be the recorder's, not capture's.
+    gaps: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -211,6 +220,8 @@ enum Source {
     Cable,
     /// Loopback of the tone device: what the user actually hears.
     Local,
+    /// Raw process loopback excluding this PID's tree: exactly what capture receives.
+    ProcessLoopback(u32),
 }
 
 /// Starts recording in a background thread; returns once the stream is running.
@@ -230,10 +241,12 @@ fn record(src: Source, ms: u64) -> JoinHandle<Recording> {
                 };
                 CaptureStream::from_device(&dev, true, 20).unwrap()
             }
+            Source::ProcessLoopback(pid) => CaptureStream::process_loopback(pid, false, 20, SAMPLE_RATE).unwrap(),
         };
         ready_tx.send(()).unwrap();
         let mut samples: Vec<f32> = Vec::new();
         let mut start_qpc: Option<u64> = None;
+        let mut gaps = 0usize;
         let deadline = Instant::now() + Duration::from_millis(ms);
         while Instant::now() < deadline {
             cap.wait(Duration::from_millis(50));
@@ -244,12 +257,18 @@ fn record(src: Source, ms: u64) -> JoinHandle<Recording> {
                 let at = (p.qpc_100ns.saturating_sub(base) as f64 * RATE as f64 / 1e7).round() as usize;
                 if at > samples.len() + 96 {
                     samples.resize(at, 0.0);
+                    if base != p.qpc_100ns {
+                        gaps += 1;
+                    }
+                }
+                if p.flags & wasapi::BUFFERFLAGS_DISCONTINUITY != 0 && base != p.qpc_100ns {
+                    gaps += 1;
                 }
                 samples.extend(p.samples.chunks(CHANNELS).map(|f| f.iter().sum::<f32>() / CHANNELS as f32));
             })
             .unwrap();
         }
-        Recording { samples, start_qpc: start_qpc.unwrap_or(0) }
+        Recording { samples, start_qpc: start_qpc.unwrap_or(0), gaps }
     });
     ready_rx.recv_timeout(Duration::from_secs(5)).expect("recorder did not start");
     h
@@ -260,6 +279,20 @@ fn record_both(ms: u64) -> (JoinHandle<Recording>, JoinHandle<Recording>) {
     (record(Source::Cable, ms), record(Source::Local, ms))
 }
 
+/// Records the cable and the local output for `ms`, repeating the measurement (up to 3
+/// times) if a *recorder* had gaps: then the instrument glitched, not capture.
+fn record_both_valid(label: &str, ms: u64) -> (Recording, Recording) {
+    for attempt in 1..=3 {
+        let (c, l) = record_both(ms);
+        let (c, l) = (c.join().unwrap(), l.join().unwrap());
+        if c.gaps == 0 {
+            return (c, l);
+        }
+        println!("[{label}] attempt {attempt}: cable recorder had {} gaps; measurement discarded", c.gaps);
+    }
+    panic!("[{label}] cable recorder kept having gaps");
+}
+
 fn levels(r: &Recording) -> (f32, f32) {
     (tone_level_db(&r.samples, RATE, F_KEPT), tone_level_db(&r.samples, RATE, F_EXCLUDED))
 }
@@ -267,8 +300,7 @@ fn levels(r: &Recording) -> (f32, f32) {
 /// Records 1 s and checks: the excluded tone is audible locally but ≥40 dB below the kept
 /// tone in the cable, and the kept tone is present in the cable.
 fn assert_excluded(label: &str) {
-    let (cable, local) = record_both(1000);
-    let (cable, local) = (cable.join().unwrap(), local.join().unwrap());
+    let (cable, local) = record_both_valid(label, 1000);
     let (k, x) = levels(&cable);
     let (lk, lx) = levels(&local);
     println!(
@@ -355,8 +387,7 @@ fn t2_control_nothing_excluded() {
     let pid = dummy.pid().to_string();
     let _cap = start_capture(&["--exclude-pid", &pid]);
     thread::sleep(Duration::from_millis(300));
-    let (cable, local) = record_both(1000);
-    let (cable, local) = (cable.join().unwrap(), local.join().unwrap());
+    let (cable, local) = record_both_valid("t2 control", 1000);
     let (k, x) = levels(&cable);
     let (lk, lx) = levels(&local);
     println!("[t2 control] cable: {F_KEPT} Hz {k:.1} dB, {F_EXCLUDED} Hz {x:.1} dB | local: {lk:.1} dB, {lx:.1} dB");
@@ -683,4 +714,185 @@ fn t9_engine_retries_output() {
     println!("[t9] audio after recovery: {F_KEPT} Hz {k:.1} dB");
     assert!(k > PRESENT_DB, "no audio after recovery");
     drop(engine);
+}
+
+/// Glitches in a recording of one pure sine of frequency `freq`: times (ms from the
+/// start of `x`) where the 2nd-order sine predictor residual
+/// `x[n] - 2cos(w)x[n-1] + x[n-2]` (≈0 for a clean sine) exceeds `thresh`. Hits closer
+/// than 5 ms are merged into one event. Returns (event times, residual floor in dB).
+fn sine_glitches(x: &[f32], freq: f32, thresh: f32) -> (Vec<f32>, f32) {
+    let c = 2.0 * (2.0 * std::f32::consts::PI * freq / RATE).cos();
+    let mut events: Vec<f32> = Vec::new();
+    let mut last = usize::MAX / 2;
+    let mut sum = 0.0f64;
+    for n in 2..x.len() {
+        let r = (x[n] - c * x[n - 1] + x[n - 2]).abs();
+        sum += (r as f64) * (r as f64);
+        if r > thresh {
+            if n.saturating_sub(last) > (RATE as usize / 200) {
+                events.push(n as f32 * 1000.0 / RATE);
+            }
+            last = n;
+        }
+    }
+    let floor = audio_exclude::dsp::to_db((sum / x.len().max(1) as f64).sqrt() as f32);
+    (events, floor)
+}
+
+/// 10. No clicks/dropouts in the first seconds after capture starts (and afterwards):
+/// a continuous 1000 Hz sine plays, capture starts while the cable is being recorded,
+/// and the cable waveform is checked sample by sample for discontinuities.
+///
+/// Reference: Windows' process loopback itself delivers a tiny step whenever any
+/// process on the system opens or closes an audio stream (see diag_loopback_vs_other_
+/// streams). Such steps are recorded by a second, raw process-loopback recorder; a cable
+/// glitch only counts against us if the raw loopback has no step 0..60 ms before it.
+#[test]
+fn t10_no_glitches_after_start() {
+    let _g = serial();
+    for attempt in 1..=3 {
+        let dummy = start_dummy();
+        let _t = start_tone(&tone_exe(), F_EXCLUDED, &["--duration", "9000"]);
+        thread::sleep(Duration::from_millis(300));
+        let cable = record(Source::Cable, 6000);
+        let raw = record(Source::ProcessLoopback(dummy.pid()), 6000);
+        thread::sleep(Duration::from_millis(300));
+        let pid = dummy.pid().to_string();
+        let cap = start_capture(&["--exclude-pid", &pid]);
+        let (cable, raw) = (cable.join().unwrap(), raw.join().unwrap());
+        drop(cap);
+        if cable.gaps > 0 || raw.gaps > 0 {
+            println!("[t10] attempt {attempt}: a recorder had gaps (system hiccup); measurement discarded");
+            continue;
+        }
+
+        // threshold: 5% of the sine amplitude (0.1); a dropped or repeated sample of a
+        // 1 kHz sine gives a residual of up to ~2x the amplitude
+        let thresh = 0.005;
+        let cable_al = align_to(&cable, &raw); // both on the raw recording's timeline
+        let onset = cable_al.iter().position(|v| v.abs() > 0.01).expect("sine never reached the cable");
+        let onset_ms = onset as f32 * 1000.0 / RATE;
+        let raw_onset = raw.samples.iter().position(|v| v.abs() > 0.01).unwrap_or(0);
+        let (rg, rfloor) = sine_glitches(&raw.samples[raw_onset..], F_EXCLUDED, thresh);
+        let rg: Vec<f32> = rg.iter().map(|t| t + raw_onset as f32 * 1000.0 / RATE).filter(|&t| t > raw_onset as f32 * 1000.0 / RATE + 2.0).collect();
+        let (cg, cfloor) = sine_glitches(&cable_al[onset..], F_EXCLUDED, thresh);
+        // the first sample after onset is a hard start (silence -> running sine, faded in)
+        let cg: Vec<f32> = cg.iter().filter(|&&t| t > 2.0).map(|t| t + onset_ms).collect();
+        let ours: Vec<f32> = cg.iter().cloned().filter(|&t| !rg.iter().any(|&r| r <= t + 5.0 && r >= t - 60.0)).collect();
+        let early = ours.iter().filter(|&&t| t < onset_ms + 3000.0).count();
+        println!(
+            "[t10 glitches] raw process loopback (reference): {} steps {:?}, floor {rfloor:.1} dB | cable: onset at {onset_ms:.0} ms, {} events {:?}, floor {cfloor:.1} dB | not explained by the reference: {} ({} in the first 3 s)",
+            rg.len(),
+            &rg[..rg.len().min(8)],
+            cg.len(),
+            &cg[..cg.len().min(8)],
+            ours.len(),
+            early
+        );
+        assert!(ours.is_empty(), "{} glitches introduced by capture after it started: {:?}", ours.len(), &ours[..ours.len().min(20)]);
+        return;
+    }
+    panic!("no valid measurement in 3 attempts (recorders kept having gaps)");
+}
+
+/// Diagnostic (ignored): glitches at the start of (a) a tone played straight into the
+/// cable, recorded from the cable, and (b) raw process-loopback capture.
+#[test]
+#[ignore]
+fn diag_glitch_sources() {
+    let _g = serial();
+    // (a) VAC + recorder alone
+    let cable = record(Source::Cable, 4000);
+    thread::sleep(Duration::from_millis(300));
+    let c = cable_name();
+    let _t = start_tone(&tone_exe(), F_EXCLUDED, &["--device", &c, "--duration", "3500"]);
+    let rec = cable.join().unwrap();
+    let onset = rec.samples.iter().position(|v| v.abs() > 0.01).unwrap_or(0);
+    let (ev, floor) = sine_glitches(&rec.samples[onset..], F_EXCLUDED, 0.005);
+    println!("[diag a: tone -> cable directly] {} events {:?} floor {floor:.1} dB", ev.len(), &ev[..ev.len().min(10)]);
+    drop(_t);
+    thread::sleep(Duration::from_millis(300));
+
+    // (b) raw process loopback (exclude a dummy), tone on the default device
+    let dummy = start_dummy();
+    let _t = start_tone(&tone_exe(), F_EXCLUDED, &["--duration", "5000"]);
+    thread::sleep(Duration::from_millis(300));
+    wasapi::init_com().unwrap();
+    let mut cap = CaptureStream::process_loopback(dummy.pid(), false, 20, SAMPLE_RATE).unwrap();
+    let mut samples = Vec::new();
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_millis(4000) {
+        cap.wait(Duration::from_millis(50));
+        cap.read(|p| samples.extend(p.samples.chunks(CHANNELS).map(|f| f[0]))).unwrap();
+    }
+    let onset = samples.iter().position(|v| v.abs() > 0.01).unwrap_or(0);
+    let (ev, floor) = sine_glitches(&samples[onset..], F_EXCLUDED, 0.005);
+    println!("[diag b: raw process loopback] onset {onset} {} events {:?} floor {floor:.1} dB", ev.len(), &ev[..ev.len().min(10)]);
+}
+
+/// Diagnostic (ignored): a synthetic sine pushed straight into our exclusive Output
+/// (no process loopback), recorded from the cable. Periods via AUDIO_EXCLUDE_PERIOD_MS.
+#[test]
+#[ignore]
+fn diag_exclusive_output_alone() {
+    let _g = serial();
+    let cable = record(Source::Cable, 4500);
+    thread::sleep(Duration::from_millis(300));
+    let out = audio_exclude::output::Output::open(&cable_name(), 15).unwrap();
+    let w = 2.0 * std::f64::consts::PI * F_EXCLUDED as f64 / out.rate as f64;
+    let mut n: u64 = 0;
+    let t0 = Instant::now();
+    // push 10 ms packets on a 10 ms schedule, like process loopback does
+    while t0.elapsed() < Duration::from_millis(4000) {
+        let due = (t0.elapsed().as_secs_f64() * out.rate as f64) as u64;
+        while n + 480 <= due + 480 {
+            let mut pkt = Vec::with_capacity(480 * CHANNELS);
+            for i in 0..480u64 {
+                let v = (0.1 * (w * (n + i) as f64).sin()) as f32;
+                pkt.extend([v, v]);
+            }
+            out.push(&pkt);
+            n += 480;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let rec = cable.join().unwrap();
+    let onset = rec.samples.iter().position(|v| v.abs() > 0.01).unwrap_or(0);
+    let (ev, floor) = sine_glitches(&rec.samples[onset..], F_EXCLUDED, 0.005);
+    println!("[diag exclusive alone] {} | {} events {:?} floor {floor:.1} dB | {:?}", out.description, ev.len(), &ev[..ev.len().min(12)], out.stats());
+}
+
+/// Diagnostic (ignored): does another stream starting/stopping on the system disturb raw
+/// process loopback (no part of our output involved)?
+#[test]
+#[ignore]
+fn diag_loopback_vs_other_streams() {
+    let _g = serial();
+    let dummy = start_dummy();
+    let _t = start_tone(&tone_exe(), F_EXCLUDED, &["--duration", "6000"]);
+    thread::sleep(Duration::from_millis(300));
+    wasapi::init_com().unwrap();
+    let mut cap = CaptureStream::process_loopback(dummy.pid(), false, 20, SAMPLE_RATE).unwrap();
+    let mut samples = Vec::new();
+    let t = Instant::now();
+    let mut other: Option<Proc> = None;
+    let mut marks = Vec::new();
+    while t.elapsed() < Duration::from_millis(5000) {
+        let ms = t.elapsed().as_millis();
+        if ms > 1000 && other.is_none() && marks.is_empty() {
+            marks.push(("start", ms));
+            // a silent stream (freq 0) opened by another process
+            other = Some(start_tone(&tone_exe(), 0.0, &["--duration", "1500"]));
+        }
+        if ms > 3500 && marks.len() == 1 {
+            marks.push(("ended by now", ms));
+            other = None;
+        }
+        cap.wait(Duration::from_millis(50));
+        cap.read(|p| samples.extend(p.samples.chunks(CHANNELS).map(|f| f[0]))).unwrap();
+    }
+    let onset = samples.iter().position(|v| v.abs() > 0.01).unwrap_or(0);
+    let (ev, floor) = sine_glitches(&samples[onset..], F_EXCLUDED, 0.005);
+    println!("[diag c: loopback while another stream starts/stops] marks {marks:?} | {} events {:?} floor {floor:.1} dB", ev.len(), &ev[..ev.len().min(10)]);
+    drop(other);
 }

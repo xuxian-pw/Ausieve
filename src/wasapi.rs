@@ -433,12 +433,32 @@ pub struct ExclusiveRender {
     pub buffer_frames: u32,
     pub rate: u32,
     pub kind: SampleKind,
+    /// Device period actually used (100-ns units).
+    pub period_hns: i64,
+    /// Minimum period the device supports (100-ns units).
+    pub min_period_hns: i64,
+    /// Set in event-driven mode: signalled each time the device wants `buffer_frames`.
+    event: Option<Event>,
     scratch: Vec<u8>,
+}
+
+/// How an exclusive stream is driven.
+#[derive(Debug, Clone, Copy)]
+pub enum ExclusiveMode {
+    /// The app polls `padding()` and writes into a buffer of this length.
+    Timer { buffer_ms: i64 },
+    /// The device signals every period and the app fills exactly one period
+    /// (`buffer_frames`) each time. `None` = the device's minimum period.
+    Event { period_hns: Option<i64> },
 }
 
 impl ExclusiveRender {
     /// Opens `dev` exclusively, trying common formats (48 kHz first, then 44.1 kHz).
     pub fn open(dev: &IMMDevice, buffer_ms: i64) -> std::result::Result<Self, String> {
+        Self::open_mode(dev, ExclusiveMode::Timer { buffer_ms })
+    }
+
+    pub fn open_mode(dev: &IMMDevice, mode: ExclusiveMode) -> std::result::Result<Self, String> {
         let probe = activate_client(dev).map_err(|e| e.to_string())?;
         let kinds = [SampleKind::F32, SampleKind::I32 { valid: 32 }, SampleKind::I32 { valid: 24 }, SampleKind::I24, SampleKind::I16];
         let mut chosen = None;
@@ -458,23 +478,50 @@ impl ExclusiveRender {
              or exclusive mode is disabled for it",
         )?;
         let fmt = extensible(rate, kind);
-        let mut hns = buffer_ms * HNS_PER_MS;
+        let mut forced: Option<i64> = None;
         for attempt in 0..2 {
             let client = activate_client(dev).map_err(|e| e.to_string())?;
             unsafe {
                 let mut min_period = 0i64;
                 client.GetDevicePeriod(None, Some(&mut min_period)).map_err(|e| e.to_string())?;
-                let period = min_period.max(3 * HNS_PER_MS);
-                let r = client.Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, 0, hns.max(period), period, &fmt.Format, None);
+                let (flags, buffer, period) = match mode {
+                    ExclusiveMode::Timer { buffer_ms } => {
+                        let period = min_period.max(3 * HNS_PER_MS);
+                        (0, forced.unwrap_or(buffer_ms * HNS_PER_MS).max(period), period)
+                    }
+                    ExclusiveMode::Event { period_hns } => {
+                        // event mode requires buffer duration == periodicity
+                        let p = forced.unwrap_or(period_hns.unwrap_or(min_period).max(min_period));
+                        (AUDCLNT_STREAMFLAGS_EVENTCALLBACK, p, p)
+                    }
+                };
+                let r = client.Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, flags, buffer, period, &fmt.Format, None);
                 match r {
                     Ok(()) => {
                         let buffer_frames = client.GetBufferSize().map_err(|e| e.to_string())?;
                         let render: IAudioRenderClient = client.GetService().map_err(|e| e.to_string())?;
-                        return Ok(Self { client, render, buffer_frames, rate, kind, scratch: Vec::new() });
+                        let event = if flags != 0 {
+                            let ev = Event::new(false).map_err(|e| e.to_string())?;
+                            client.SetEventHandle(ev.0).map_err(|e| e.to_string())?;
+                            Some(ev)
+                        } else {
+                            None
+                        };
+                        return Ok(Self {
+                            client,
+                            render,
+                            buffer_frames,
+                            rate,
+                            kind,
+                            period_hns: period,
+                            min_period_hns: min_period,
+                            event,
+                            scratch: Vec::new(),
+                        });
                     }
                     Err(e) if e.code() == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED && attempt == 0 => {
                         let frames = client.GetBufferSize().map_err(|e| e.to_string())? as i64;
-                        hns = (10_000_000 * frames + rate as i64 / 2) / rate as i64;
+                        forced = Some((10_000_000 * frames + rate as i64 / 2) / rate as i64);
                     }
                     Err(e) if e.code() == AUDCLNT_E_DEVICE_IN_USE => {
                         return Err("output device is in use by another application in exclusive mode".into())
@@ -492,6 +539,37 @@ impl ExclusiveRender {
 
     pub fn padding(&self) -> Result<u32> {
         unsafe { self.client.GetCurrentPadding() }
+    }
+
+    /// Event mode: writes exactly one period (`buffer_frames` frames of interleaved
+    /// stereo f32).
+    pub fn write_period(&mut self, interleaved: &[f32]) -> Result<()> {
+        let n = self.buffer_frames as usize;
+        debug_assert_eq!(interleaved.len(), n * CHANNELS);
+        self.encode(&interleaved[..n * CHANNELS]);
+        unsafe {
+            let p = self.render.GetBuffer(n as u32)?;
+            std::ptr::copy_nonoverlapping(self.scratch.as_ptr(), p, self.scratch.len());
+            self.render.ReleaseBuffer(n as u32, 0)
+        }
+    }
+
+    fn encode(&mut self, interleaved: &[f32]) {
+        self.scratch.clear();
+        for &v in interleaved {
+            let v = v.clamp(-1.0, 1.0);
+            match self.kind {
+                SampleKind::F32 => self.scratch.extend_from_slice(&v.to_le_bytes()),
+                SampleKind::I32 { .. } => self.scratch.extend_from_slice(&((v as f64 * 2147483647.0) as i32).to_le_bytes()),
+                SampleKind::I24 => self.scratch.extend_from_slice(&((v as f64 * 8388607.0) as i32).to_le_bytes()[..3]),
+                SampleKind::I16 => self.scratch.extend_from_slice(&((v * 32767.0) as i16).to_le_bytes()),
+            }
+        }
+    }
+
+    /// Event mode: waits until the device wants the next period. Returns false on timeout.
+    pub fn wait(&self, timeout: Duration) -> bool {
+        self.event.as_ref().is_some_and(|e| e.wait(timeout))
     }
 
     /// Writes as many frames of interleaved stereo f32 as fit; returns frames written.
@@ -525,6 +603,54 @@ impl Drop for ExclusiveRender {
     fn drop(&mut self) {
         unsafe {
             let _ = self.client.Stop();
+        }
+    }
+}
+
+/// Current time on the QPC clock in 100-ns units (the clock of `Packet::qpc_100ns`).
+pub fn qpc_now_100ns() -> u64 {
+    use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+    let (mut c, mut f) = (0i64, 0i64);
+    unsafe {
+        let _ = QueryPerformanceCounter(&mut c);
+        let _ = QueryPerformanceFrequency(&mut f);
+    }
+    (c as i128 * 10_000_000 / f.max(1) as i128) as u64
+}
+
+/// Registers the calling thread with MMCSS ("Pro Audio") so audio deadlines are met
+/// under CPU load. Best effort.
+pub fn boost_thread_priority() {
+    use windows::Win32::System::Threading::AvSetMmThreadCharacteristicsW;
+    let mut task = 0u32;
+    unsafe {
+        let _ = AvSetMmThreadCharacteristicsW(windows::core::w!("Pro Audio"), &mut task);
+    }
+}
+
+/// Raises the system timer resolution to 1 ms while alive, so `thread::sleep(1 ms)`
+/// really sleeps ~1 ms (the default granularity is ~15.6 ms).
+pub struct HighResTimer;
+
+impl HighResTimer {
+    pub fn new() -> HighResTimer {
+        unsafe {
+            windows::Win32::Media::timeBeginPeriod(1);
+        }
+        HighResTimer
+    }
+}
+
+impl Default for HighResTimer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for HighResTimer {
+    fn drop(&mut self) {
+        unsafe {
+            windows::Win32::Media::timeEndPeriod(1);
         }
     }
 }

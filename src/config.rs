@@ -17,11 +17,13 @@ pub struct Config {
     pub programs: Vec<String>,
     /// The program currently excluded (one of `programs`), or `None` = exclude nothing.
     pub selected: Option<String>,
+    /// Jitter-buffer level in ms: lower = less latency, higher = more robust.
+    pub buffer_ms: u32,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { output: DEFAULT_OUTPUT.into(), programs: Vec::new(), selected: None }
+        Config { output: DEFAULT_OUTPUT.into(), programs: Vec::new(), selected: None, buffer_ms: crate::engine::DEFAULT_BUFFER_MS }
     }
 }
 
@@ -97,6 +99,7 @@ impl Config {
         if self.output.trim().is_empty() {
             self.output = DEFAULT_OUTPUT.into();
         }
+        self.buffer_ms = self.buffer_ms.clamp(crate::engine::MIN_BUFFER_MS, crate::engine::MAX_BUFFER_MS);
     }
 }
 
@@ -152,6 +155,9 @@ mod tests {
         assert_eq!(c.programs, vec![r"C:\x.exe".to_string()]);
         assert_eq!(c.selected, None);
         assert_eq!(c.output, DEFAULT_OUTPUT);
+        assert_eq!(c.buffer_ms, crate::engine::DEFAULT_BUFFER_MS, "missing field gets the default");
+        std::fs::write(&p, r#"{"buffer_ms":1}"#).unwrap();
+        assert_eq!(Config::load(&p).unwrap().buffer_ms, crate::engine::MIN_BUFFER_MS, "clamped");
         std::fs::write(&p, "not json").unwrap();
         assert!(Config::load(&p).is_err());
         let _ = std::fs::remove_dir_all(p.parent().unwrap().parent().unwrap());

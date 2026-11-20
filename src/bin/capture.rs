@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! capture [--exclude-name Discord.exe | --exclude-path C:\...\Discord.exe | --exclude-pid 1234]
-//!         [--output "Line 1 (Virtual Audio Cable)"]
+//!         [--output "Line 1 (Virtual Audio Cable)"] [--buffer-ms 15]
 //! capture --list-devices
 //! ```
 //!
@@ -13,7 +13,7 @@
 
 use std::process::ExitCode;
 
-use audio_exclude::engine::{Engine, Event, Target};
+use audio_exclude::engine::{Engine, Event, Target, DEFAULT_BUFFER_MS};
 use audio_exclude::wasapi;
 use windows::Win32::Media::Audio::{eCapture, eRender};
 
@@ -22,13 +22,14 @@ const DEFAULT_OUTPUT: &str = "Line 1 (Virtual Audio Cable)";
 struct Args {
     target: Target,
     output: String,
+    buffer_ms: u32,
 }
 
-const USAGE: &str = "usage: capture [--exclude-name NAME.exe | --exclude-path PATH | --exclude-pid PID] [--output DEVICE]\n       capture --list-devices";
+const USAGE: &str = "usage: capture [--exclude-name NAME.exe | --exclude-path PATH | --exclude-pid PID] [--output DEVICE] [--buffer-ms N]\n       capture --list-devices";
 
 fn parse() -> Result<Option<Args>, String> {
     let mut it = std::env::args().skip(1);
-    let mut a = Args { target: Target::None, output: DEFAULT_OUTPUT.into() };
+    let mut a = Args { target: Target::None, output: DEFAULT_OUTPUT.into(), buffer_ms: DEFAULT_BUFFER_MS };
     while let Some(s) = it.next() {
         match s.as_str() {
             "--exclude-name" => a.target = Target::Name(it.next().ok_or("--exclude-name needs a value")?),
@@ -39,6 +40,9 @@ fn parse() -> Result<Option<Args>, String> {
                 )
             }
             "--output" => a.output = it.next().ok_or("--output needs a value")?,
+            "--buffer-ms" => {
+                a.buffer_ms = it.next().and_then(|v| v.parse().ok()).ok_or("--buffer-ms needs a number")?
+            }
             "--list-devices" => {
                 list_devices();
                 return Ok(None);
@@ -76,7 +80,7 @@ fn main() -> ExitCode {
     let mut ready = false;
     // The CLI keeps its original fail-fast behaviour: an output error ends the process
     // (the tray app instead lets the engine retry).
-    let _engine = Engine::start(args.target, args.output, move |ev| match ev {
+    let _engine = Engine::start_with(args.target, args.output, args.buffer_ms, move |ev| match ev {
         Event::Output(Ok(desc)) => eprintln!("capture: output {desc}"),
         Event::Output(Err(e)) | Event::CaptureError(e) => {
             eprintln!("capture: {e}");
