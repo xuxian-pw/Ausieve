@@ -96,10 +96,10 @@ cargo build --release
 
 生成 `target\release\` 下的 `tray.exe`（托盘程序）、`capture.exe`（命令行版本）和 `tone.exe`（测试辅助程序）。
 
-打包安装程序需要 [Inno Setup 6](https://jrsoftware.org/isinfo.php)，生成 `target\installer\audio-exclude-setup-<版本>.exe`：
+打包安装程序需要 [Inno Setup 6](https://jrsoftware.org/isinfo.php)。下面的脚本会重新构建（去掉 exe 里的本机路径），再生成 `target\installer\audio-exclude-setup-<版本>.exe`，版本号取自 `Cargo.toml`：
 
 ```powershell
-& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" /DAppVersion=0.1.0 installer\audio-exclude.iss
+powershell -ExecutionPolicy Bypass -File installer\build.ps1
 ```
 
 图标 `assets/app.ico`（正常）和 `assets/warn.ico`（出错）由 `python assets/make_icons.py`（需要 Pillow）生成，已经提交进仓库，平时构建不需要 Python。

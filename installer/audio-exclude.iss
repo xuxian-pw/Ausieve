@@ -1,10 +1,12 @@
 ; Inno Setup script for audio-exclude.
-; Build: cargo build --release, then
-;   ISCC.exe /DAppVersion=0.1.0 installer\audio-exclude.iss
+; Release builds: run installer\build.ps1 (strips local paths, then calls ISCC).
 ; Output: target\installer\audio-exclude-setup-<version>.exe
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
+#endif
+#ifndef BinDir
+  #define BinDir "..\target\release"
 #endif
 
 #define AppName "audio-exclude"
@@ -43,8 +45,8 @@ Name: "autostart"; Description: "Start audio-exclude when I sign in"; GroupDescr
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional options:"; Flags: unchecked
 
 [Files]
-Source: "..\target\release\tray.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\target\release\capture.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#BinDir}\tray.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#BinDir}\capture.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 
