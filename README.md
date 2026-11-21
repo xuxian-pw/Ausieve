@@ -78,6 +78,20 @@ capture.exe --exclude-name Discord.exe --output "Line 1 (Virtual Audio Cable)"
 
 不带 `--exclude-*` 时转发全部系统声音。stdout 输出状态行：`TARGET <pid>` / `TARGET none` / `READY`。
 
+## 诊断
+
+不能用的时候，在安装目录（默认 `%LOCALAPPDATA%\Programs\Ausieve`）里运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File diagnose.ps1
+```
+
+几秒后会在桌面生成 `Ausieve-diagnose-<时间>.txt`，提交问题时附上这个文件即可。里面有系统版本、音频设备和驱动、配置文件、一次 5 秒的 `capture.exe` 试运行结果，以及 RustDesk 的 Audio input 设置。
+
+- 只读取信息，不修改任何设置。用户目录会替换成 `%USERPROFILE%`。RustDesk 的配置文件里只读取 `audio-input` 这一行。
+- Ausieve 正在运行时，它独占着输出设备，脚本会跳过试运行。要包含这一项，先从托盘菜单退出 Ausieve，再运行脚本。
+- RustDesk 以服务方式安装时，它的设置保存在系统目录里，要用管理员身份运行脚本才能读到。
+
 ## 已知限制
 
 - 运行期间**独占**虚拟声卡的播放端，其他程序不能同时往这条线播放。这是必须的：用共享模式输出，自己的声音会被再次采集，形成回环。

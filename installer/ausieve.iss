@@ -46,13 +46,15 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 [Files]
 Source: "{#BinDir}\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BinDir}\capture.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\scripts\diagnose.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 
 [InstallDelete]
 ; Leftovers from before the rename (audio-exclude, tray.exe); same AppId, so this is an
 ; upgrade. The old tray.exe is stopped in PrepareToInstall below.
 Type: files; Name: "{app}\tray.exe"
+; 0.1.0 also installed the README.
+Type: files; Name: "{app}\README.md"
 Type: files; Name: "{userstartup}\audio-exclude.lnk"
 Type: files; Name: "{autodesktop}\audio-exclude.lnk"
 Type: files; Name: "{group}\audio-exclude.lnk"
