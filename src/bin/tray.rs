@@ -35,14 +35,9 @@ const ID_NONE: usize = 1;
 const ID_ADD: usize = 2;
 const ID_EXIT: usize = 3;
 const ID_OPEN_DIR: usize = 4;
-const ID_DITHER: usize = 5;
 const ID_PROGRAM: usize = 1000; // + index
 const ID_REMOVE: usize = 2000; // + index
 const ID_OUTPUT: usize = 3000; // + index
-const ID_BUFFER: usize = 4000; // + index into BUFFER_CHOICES
-
-/// Jitter-buffer choices offered in the menu (ms).
-const BUFFER_CHOICES: [u32; 5] = [11, 12, 15, 20, 30];
 
 #[derive(Default)]
 struct Status {
@@ -192,12 +187,13 @@ impl App {
     fn build_menu(&mut self) -> windows::core::Result<HMENU> {
         unsafe {
             let m = CreatePopupMenu()?;
-            let (a, b) = self.status_lines();
-            AppendMenuW(m, MF_STRING | MF_GRAYED, 0, &HSTRING::from(a))?;
-            AppendMenuW(m, MF_STRING | MF_GRAYED, 0, &HSTRING::from(b))?;
-            AppendMenuW(m, MF_SEPARATOR, 0, None)?;
-            AppendMenuW(m, MF_STRING | MF_GRAYED, 0, w!("排除哪个程序（一次只能排除一个）"))?;
-            AppendMenuW(m, MF_STRING, ID_NONE, w!("不排除（转发全部声音）"))?;
+            // Normal status is in the tooltip; the menu only surfaces an output error.
+            if let Some(Err(_)) = &self.status.output {
+                let (_, out) = self.status_lines();
+                AppendMenuW(m, MF_STRING | MF_GRAYED, 0, &HSTRING::from(out))?;
+                AppendMenuW(m, MF_SEPARATOR, 0, None)?;
+            }
+            AppendMenuW(m, MF_STRING, ID_NONE, w!("不排除"))?;
             let mut checked = ID_NONE;
             for (i, p) in self.cfg.programs.iter().enumerate() {
                 let selected = self.cfg.selected.as_deref().is_some_and(|s| normalize_path(s) == normalize_path(p));
@@ -225,7 +221,7 @@ impl App {
             for (i, p) in self.cfg.programs.iter().enumerate() {
                 AppendMenuW(rm, MF_STRING, ID_REMOVE + i, &HSTRING::from(p.as_str()))?;
             }
-            AppendMenuW(m, MF_POPUP, rm.0 as usize, w!("移除程序（显示完整路径）"))?;
+            AppendMenuW(m, MF_POPUP, rm.0 as usize, w!("移除程序"))?;
 
             let om = CreatePopupMenu()?;
             self.menu_outputs = wasapi::list_devices(eRender).map(|d| d.into_iter().map(|(n, _)| n).collect()).unwrap_or_default();
@@ -242,18 +238,6 @@ impl App {
             }
             AppendMenuW(m, MF_POPUP, om.0 as usize, w!("输出设备"))?;
 
-            let bm = CreatePopupMenu()?;
-            AppendMenuW(bm, MF_STRING | MF_GRAYED, 0, w!("越小延迟越低，越大越不容易断音"))?;
-            for (i, &ms) in BUFFER_CHOICES.iter().enumerate() {
-                let text = if ms == audio_exclude::engine::DEFAULT_BUFFER_MS { format!("{ms} ms（默认）") } else { format!("{ms} ms") };
-                AppendMenuW(bm, MF_STRING, ID_BUFFER + i, &HSTRING::from(text))?;
-                if ms == self.cfg.buffer_ms {
-                    set_radio(bm, ID_BUFFER + i);
-                }
-            }
-            AppendMenuW(m, MF_POPUP, bm.0 as usize, &HSTRING::from(format!("缓冲 / 延迟（{} ms）", self.cfg.buffer_ms)))?;
-            let dither_flags = if self.cfg.silence_dither { MF_STRING | MF_CHECKED } else { MF_STRING };
-            AppendMenuW(m, dither_flags, ID_DITHER, w!("静音时输出微弱底噪（防远端静音门限）"))?;
             AppendMenuW(m, MF_STRING, ID_OPEN_DIR, w!("打开配置文件夹"))?;
             AppendMenuW(m, MF_SEPARATOR, 0, None)?;
             AppendMenuW(m, MF_STRING, ID_EXIT, w!("退出"))?;
@@ -339,15 +323,6 @@ fn on_command(hwnd: HWND, cmd: usize) {
                 a.apply_selection();
             });
         }
-        ID_DITHER => {
-            with_app(|a| {
-                a.cfg.silence_dither = !a.cfg.silence_dither;
-                a.save();
-                if let Some(e) = &a.engine {
-                    e.set_dither(a.cfg.silence_dither);
-                }
-            });
-        }
         ID_OPEN_DIR => {
             with_app(|a| {
                 if let Some(dir) = a.cfg_path.parent() {
@@ -374,20 +349,7 @@ fn on_command(hwnd: HWND, cmd: usize) {
                 }
             });
         }
-        c if c >= ID_BUFFER => {
-            with_app(|a| {
-                if let Some(&ms) = BUFFER_CHOICES.get(c - ID_BUFFER) {
-                    if ms != a.cfg.buffer_ms {
-                        a.cfg.buffer_ms = ms;
-                        a.save();
-                        if let Some(e) = &a.engine {
-                            e.set_buffer_ms(ms);
-                        }
-                    }
-                }
-            });
-        }
-        c if (ID_OUTPUT..ID_BUFFER).contains(&c) => {
+        c if c >= ID_OUTPUT => {
             with_app(|a| {
                 if let Some(n) = a.menu_outputs.get(c - ID_OUTPUT).cloned() {
                     if n != a.cfg.output {
@@ -512,7 +474,7 @@ fn main() {
             taskbar_created,
             cfg,
         };
-        let (target, output, buffer_ms, dither) = (target_of(&app.cfg), app.cfg.output.clone(), app.cfg.buffer_ms, app.cfg.silence_dither);
+        let (target, output, buffer_ms, dither) = (target_of(&app.cfg), app.cfg.output.clone(), app.cfg.buffer_ms(), app.cfg.silence_dither);
         APP.with(|a| *a.borrow_mut() = Some(app));
         with_app(|a| {
             a.refresh_icon(true);
