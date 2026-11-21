@@ -6,3 +6,6 @@
 /test-output/
 *.wav
 *.log
+
+# icon preview written by assets/make_icons.py
+/assets/preview.png

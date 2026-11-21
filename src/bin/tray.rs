@@ -14,7 +14,7 @@ use audio_exclude::engine::{Engine, Event, Target};
 use audio_exclude::procs::{self, file_name, normalize_path};
 use audio_exclude::wasapi;
 use windows::core::{w, HSTRING, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Media::Audio::eRender;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -56,6 +56,20 @@ struct App {
     /// Output device names as listed in the last menu (index -> name).
     menu_outputs: Vec<String>,
     taskbar_created: u32,
+    /// Tray icons from the exe's resources (`assets/app.rc`): normal, and shown while failing.
+    icon_ok: HICON,
+    icon_warn: HICON,
+}
+
+/// Loads icon resource `id` at the small-icon size the tray uses.
+fn load_icon(hinst: HINSTANCE, id: u16, fallback: PCWSTR) -> HICON {
+    unsafe {
+        let (cx, cy) = (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+        match LoadImageW(Some(hinst), PCWSTR(id as usize as *const u16), IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR) {
+            Ok(h) => HICON(h.0),
+            Err(_) => LoadIconW(None, fallback).unwrap_or_default(),
+        }
+    }
 }
 
 thread_local! {
@@ -124,7 +138,7 @@ impl App {
         let mut nid = self.nid();
         nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
         let bad = matches!(self.status.output, Some(Err(_))) || self.status.capture_error.is_some();
-        nid.hIcon = unsafe { LoadIconW(None, if bad { IDI_WARNING } else { IDI_APPLICATION }) }.unwrap_or_default();
+        nid.hIcon = if bad { self.icon_warn } else { self.icon_ok };
         let (a, b) = self.status_lines();
         fill(&mut nid.szTip, &format!("audio-exclude\n{a}\n{b}"));
         unsafe {
@@ -472,6 +486,8 @@ fn main() {
             status: Status::default(),
             menu_outputs: Vec::new(),
             taskbar_created,
+            icon_ok: load_icon(hinst.into(), 1, IDI_APPLICATION),
+            icon_warn: load_icon(hinst.into(), 2, IDI_WARNING),
             cfg,
         };
         let (target, output, buffer_ms, dither) = (target_of(&app.cfg), app.cfg.output.clone(), app.cfg.buffer_ms(), app.cfg.silence_dither);

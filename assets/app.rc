@@ -1,0 +1,3 @@
+// Icons embedded into every binary. The lowest ID is what Explorer shows for the exe.
+1 ICON "app.ico"
+2 ICON "warn.ico"

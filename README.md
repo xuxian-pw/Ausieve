@@ -27,6 +27,8 @@ cargo build --release
 - `target\release\capture.exe`：命令行版本。
 - `target\release\tone.exe`：测试辅助程序。
 
+图标在 `assets/`：`app.ico` 是正常状态，`warn.ico` 是托盘在输出或采集出错时显示的版本，由 `build.rs` 通过 `assets/app.rc` 编进每个 exe。构建要用到 Windows SDK 里的 `rc.exe`。两个 `.ico` 是 `python assets/make_icons.py`（需要 Pillow）生成的，已经提交进仓库，平时构建不需要 Python。改图标时改这个脚本再重新生成，它会顺便输出 `assets/preview.png`（不提交）方便预览。
+
 ## 托盘程序（推荐）
 
 双击 `tray.exe`，它会常驻系统托盘，没有控制台窗口。左键或右键单击图标打开菜单：
