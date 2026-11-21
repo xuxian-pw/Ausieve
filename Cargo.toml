@@ -1,6 +1,6 @@
 [package]
 name = "ausieve"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Capture all system audio except one process tree (WASAPI process loopback) and play it into a virtual audio cable."
 license = "MIT"
