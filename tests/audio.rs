@@ -214,6 +214,10 @@ fn start_dummy() -> Proc {
 }
 
 fn start_capture(args: &[&str]) -> Proc {
+    start_capture_env(args, &[])
+}
+
+fn start_capture_env(args: &[&str], env: &[(&str, &str)]) -> Proc {
     let cable = cable_name();
     let mut all: Vec<&str> = args.to_vec();
     all.extend(["--output", cable.as_str()]);
@@ -223,7 +227,9 @@ fn start_capture(args: &[&str]) -> Proc {
     }
     // AUDIO_EXCLUDE_CAPTURE_EXE: run the tests against another build (A/B comparisons)
     let exe = std::env::var_os("AUDIO_EXCLUDE_CAPTURE_EXE").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_capture")));
-    let mut p = Proc::spawn(&exe, &all);
+    let mut cmd = Command::new(&exe);
+    cmd.args(&all).envs(env.iter().copied());
+    let mut p = Proc::spawn_cmd(cmd);
     p.wait_line("READY", Duration::from_secs(5));
     p
 }
@@ -1252,4 +1258,286 @@ fn diag_packets_on_stream_open() {
     }
     let (ev, floor) = sine_glitches(&samples[RATE as usize / 100..], F_EXCLUDED, 0.005);
     println!("[diag packets] {} packets, data {:.1} ms vs timestamps {:.1} ms; contiguous-data glitches {} {:?} (floor {floor:.1} dB), top {}", log.len(), frames_total as f64 * 1000.0 / RATE as f64, (log.last().unwrap().1 - q0) as f64 / 1e4 + 10.0, ev.len(), ev, top_residuals(&samples[RATE as usize / 100..], F_EXCLUDED, 10.0));
+}
+
+/// A recording with its packet log, samples appended contiguously (no timestamp
+/// placement): shows both lost audio (timestamp steps) and waveform jumps.
+struct PacketRec {
+    samples: Vec<f32>,
+    /// (qpc 100 ns, frames, flags) per packet.
+    log: Vec<(u64, usize, u32)>,
+}
+
+impl PacketRec {
+    /// Packets whose timestamp is more than 1 ms past the end of the previous one:
+    /// (sample index in `samples`, qpc ms, missing ms).
+    fn timestamp_gaps(&self) -> Vec<(usize, f64, f64)> {
+        let mut pos = 0usize;
+        let mut out = Vec::new();
+        for i in 0..self.log.len() {
+            if i > 0 {
+                let (q0, n0, _) = self.log[i - 1];
+                let expect = q0 as f64 + n0 as f64 * 1e7 / RATE as f64;
+                let missing = (self.log[i].0 as f64 - expect) / 1e4;
+                if missing > 1.0 {
+                    out.push((pos, self.log[i].0 as f64 / 1e4, missing));
+                }
+            }
+            pos += self.log[i].1;
+        }
+        out
+    }
+    fn flagged(&self) -> usize {
+        self.log.iter().skip(1).filter(|p| p.2 & wasapi::BUFFERFLAGS_DISCONTINUITY != 0).count()
+    }
+}
+
+fn record_packets(src: Source, ms: u64) -> JoinHandle<PacketRec> {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let h = thread::spawn(move || {
+        wasapi::init_com().unwrap();
+        let mut cap = match src {
+            Source::Cable => CaptureStream::from_device(&wasapi::find_device(&cable_name(), eCapture).unwrap(), false, 20).unwrap(),
+            Source::Local => {
+                let dev = match tone_device() {
+                    Some(n) => wasapi::find_device(&n, eRender).unwrap(),
+                    None => wasapi::default_device(eRender).unwrap(),
+                };
+                CaptureStream::from_device(&dev, true, 20).unwrap()
+            }
+            Source::ProcessLoopback(pid) => CaptureStream::process_loopback(pid, false, 20, SAMPLE_RATE).unwrap(),
+        };
+        ready_tx.send(()).unwrap();
+        let mut r = PacketRec { samples: Vec::new(), log: Vec::new() };
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < deadline {
+            cap.wait(Duration::from_millis(50));
+            cap.read(|p| {
+                r.log.push((p.qpc_100ns, p.samples.len() / CHANNELS, p.flags));
+                r.samples.extend(p.samples.chunks(CHANNELS).map(|f| f.iter().sum::<f32>() / CHANNELS as f32));
+            })
+            .unwrap();
+        }
+        r
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).expect("recorder did not start");
+    h
+}
+
+/// Opens and closes a short shared-mode stream on the tone device `n` times, every
+/// `every_ms`, like rapid clicks on the volume slider (each click plays a new ding).
+/// `beep`: the stream plays a short 3 kHz blip instead of silence. Returns the open
+/// times (qpc ms).
+fn rapid_streams(n: usize, every_ms: u64, beep: bool) -> Vec<f64> {
+    wasapi::init_com().unwrap();
+    let dev = match tone_device() {
+        Some(d) => wasapi::find_device(&d, eRender).unwrap(),
+        None => wasapi::default_device(eRender).unwrap(),
+    };
+    let mut opened = Vec::new();
+    for _ in 0..n {
+        let t = Instant::now();
+        opened.push(wasapi::qpc_now_100ns() as f64 / 1e4);
+        let s = wasapi::RenderStream::open(&dev, 50).unwrap();
+        let len = (RATE * 0.04) as usize;
+        let buf: Vec<f32> = (0..len)
+            .flat_map(|i| {
+                let v = if beep { 0.05 * (2.0 * std::f32::consts::PI * 3000.0 * i as f32 / RATE).sin() } else { 0.0 };
+                [v; CHANNELS]
+            })
+            .collect();
+        s.write(&buf).unwrap();
+        s.start().unwrap();
+        thread::sleep(Duration::from_millis(60));
+        drop(s);
+        if let Some(rest) = Duration::from_millis(every_ms).checked_sub(t.elapsed()) {
+            thread::sleep(rest);
+        }
+    }
+    opened
+}
+
+/// Diagnostic (ignored): a continuous 1000 Hz sine plays; another stream is opened and
+/// closed 20 times in a row (`AUDIO_EXCLUDE_EVERY_MS`, default 150). Raw process
+/// loopback and device loopback of the tone device are recorded at the same time; for
+/// each: timestamp gaps (lost audio), DATA_DISCONTINUITY flags, and waveform jumps.
+#[test]
+#[ignore]
+fn diag_rapid_streams() {
+    let _g = serial();
+    let every: u64 = std::env::var("AUDIO_EXCLUDE_EVERY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(150);
+    let dummy = start_dummy();
+    let _t = start_tone(&tone_exe(), F_EXCLUDED, &["--duration", "12000"]);
+    thread::sleep(Duration::from_millis(500));
+    let ms = 20 * every + 2000;
+    let raw = record_packets(Source::ProcessLoopback(dummy.pid()), ms);
+    let dev = record_packets(Source::Local, ms);
+    thread::sleep(Duration::from_millis(700));
+    let opened = rapid_streams(20, every, std::env::var_os("AUDIO_EXCLUDE_BEEP").is_some());
+    let (raw, dev) = (raw.join().unwrap(), dev.join().unwrap());
+    println!("[diag rapid] streams opened every {every} ms at qpc {:.0}..{:.0} ms", opened[0], opened[opened.len() - 1]);
+    for (name, r) in [("process loopback", &raw), ("device loopback", &dev)] {
+        let skip = RATE as usize / 10;
+        let (ev, floor) = sine_glitches(&r.samples[skip..], F_EXCLUDED, 0.005);
+        let gaps = r.timestamp_gaps();
+        let jumps_at_gaps = gaps.iter().filter(|(p, _, _)| ev.iter().any(|&t| ((t * RATE / 1000.0) as isize + skip as isize - *p as isize).abs() < 48)).count();
+        println!(
+            "[diag rapid] {name}: {} packets, {} DATA_DISCONTINUITY flags, {} timestamp gaps (missing ms {:?}), {} waveform jumps (floor {floor:.1} dB), {jumps_at_gaps} of the gaps have a jump within 1 ms",
+            r.log.len(),
+            r.flagged(),
+            gaps.len(),
+            gaps.iter().map(|g| (g.2 * 10.0).round() / 10.0).collect::<Vec<_>>(),
+            ev.len(),
+        );
+        println!("[diag rapid] {name} top residuals {}", top_residuals(&r.samples[skip..], F_EXCLUDED, 0.0));
+        let (ev, _) = sine_glitches(&r.samples[skip..], F_EXCLUDED, 0.005);
+        let pos: Vec<f32> = gaps.iter().map(|g| g.0 as f32 * 1000.0 / RATE).collect();
+        println!("[diag rapid] {name} jumps at {:?}
+   gaps at {:?}", &ev[..ev.len().min(12)].iter().map(|t| t + 100.0).collect::<Vec<_>>(), &pos[..pos.len().min(6)]);
+    }
+    // packets around the first two holes
+    let mut pos = 0usize;
+    let g: Vec<usize> = raw.timestamp_gaps().iter().map(|g| g.0).take(2).collect();
+    for (k, &(q, n, f)) in raw.log.iter().enumerate() {
+        if g.iter().any(|&gp| pos + 1000 >= gp && pos <= gp + 2500) {
+            let (pq, pn, _) = if k > 0 { raw.log[k - 1] } else { (q, 0, 0) };
+            let step = (q as f64 - pq as f64) / 1e4 - pn as f64 * 1000.0 / RATE as f64;
+            // largest residual inside this packet
+            let c = 2.0 * (2.0 * std::f32::consts::PI * F_EXCLUDED / RATE).cos();
+            let (mut mr, mut at) = (0.0f32, 0usize);
+            for j in pos.max(2)..pos + n {
+                let r = (raw.samples[j] - c * raw.samples[j - 1] + raw.samples[j - 2]).abs();
+                if r > mr { mr = r; at = j - pos; }
+            }
+            let pk = raw.samples[pos..pos + n].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let first_nz = raw.samples[pos..pos + n].iter().position(|v| *v != 0.0);
+            println!("   pkt #{k} at sample {pos} ({:.1} ms): frames {n} flags {f:#x} ts step beyond prev end {step:+.2} ms | max residual {mr:.4} at +{at} | peak {pk:.4} first nonzero {first_nz:?}", pos as f32 * 1000.0 / RATE);
+        }
+        pos += n;
+    }
+    // the same raw packets through the concealer (offline)
+    let mut cc = audio_exclude::conceal::Concealer::new(SAMPLE_RATE);
+    let mut out = Vec::new();
+    let mut i = 0;
+    for &(q, n, _) in &raw.log {
+        let pkt: Vec<f32> = raw.samples[i..i + n].iter().flat_map(|v| [*v; CHANNELS]).collect();
+        out.extend(cc.process(&pkt, q).chunks(CHANNELS).map(|f| f[0]));
+        i += n;
+    }
+    let (ev, floor) = sine_glitches(&out[RATE as usize / 10..], F_EXCLUDED, 0.005);
+    println!("[diag rapid] process loopback concealed offline: {} holes filled, {} waveform jumps left (floor {floor:.1} dB), top residuals {}", cc.concealed, ev.len(), top_residuals(&out[RATE as usize / 10..], F_EXCLUDED, 100.0));
+}
+
+/// One run of the "rapid volume clicks" scenario through capture: a continuous 1000 Hz
+/// sine plays while another stream opens and closes 20 times, every 150 ms. Returns
+/// (cable glitch times in ms, holes in the raw process loopback, report), or None if
+/// the cable recorder had gaps.
+fn rapid_clicks_through_capture(env: &[(&str, &str)]) -> Option<(Vec<f32>, usize, String)> {
+    let dummy = start_dummy();
+    let pid = dummy.pid().to_string();
+    let _t = start_tone(&tone_exe(), F_EXCLUDED, &["--duration", "9000"]);
+    let _cap = start_capture_env(&["--exclude-pid", &pid], env);
+    thread::sleep(Duration::from_millis(1000));
+    let cable = record(Source::Cable, 5000);
+    let raw = record_packets(Source::ProcessLoopback(dummy.pid()), 5000);
+    thread::sleep(Duration::from_millis(700));
+    rapid_streams(20, 150, false);
+    let (cable, raw) = (cable.join().unwrap(), raw.join().unwrap());
+    if cable.gaps > 0 {
+        return None;
+    }
+    let holes = raw.timestamp_gaps().len();
+    let skip = RATE as usize / 10;
+    let (ev, floor) = sine_glitches(&cable.samples[skip..], F_EXCLUDED, 0.005);
+    let ev: Vec<f32> = ev.iter().map(|t| t + 100.0).collect();
+    let report = format!(
+        "raw process loopback: {holes} holes ({} waveform jumps) | cable: {} glitches {:?}, floor {floor:.1} dB, top residuals {}",
+        sine_glitches(&raw.samples[skip..], F_EXCLUDED, 0.005).0.len(),
+        ev.len(),
+        &ev[..ev.len().min(8)],
+        top_residuals(&cable.samples[skip..], F_EXCLUDED, 100.0)
+    );
+    Some((ev, holes, report))
+}
+
+/// 13. Rapid clicks on the volume slider (each plays a new ding): every stream another
+/// program opens or closes makes process loopback lose ~40 ms (a timestamp hole, then
+/// zeros). Capture must conceal that: the cable carries the continuous sine without a
+/// single discontinuity above the t10/t11 threshold. The same scenario without
+/// concealment (`AUDIO_EXCLUDE_NO_CONCEAL`) is measured too, proving the scenario
+/// does trigger the losses and the test detects them.
+#[test]
+fn t13_rapid_stream_open_close() {
+    let _g = serial();
+    for (label, env) in [("without concealment", &[("AUDIO_EXCLUDE_NO_CONCEAL", "1")][..]), ("with concealment", &[][..])] {
+        let (ev, holes, report) = (1..=3).find_map(|_| rapid_clicks_through_capture(env)).expect("cable recorder kept having gaps");
+        println!("[t13 {label}] {report}");
+        assert!(holes >= 10, "[t13 {label}] the scenario lost too little audio to test anything: {holes} holes
+{report}");
+        if env.is_empty() {
+            assert!(ev.is_empty(), "[t13] {} discontinuities in the cable despite concealment: {ev:?}
+{report}", ev.len());
+        } else {
+            assert!(!ev.is_empty(), "[t13] without concealment the cable should show the losses
+{report}");
+        }
+        thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// Diagnostic (ignored): the real thing. A ding (`AUDIO_EXCLUDE_DING`, default
+/// Windows Background.wav) restarted 15 times every 150 ms (`SoundPlayer.Play()`, like
+/// rapid clicks on the volume slider), through capture with and without concealment.
+/// The cable is compared with device loopback (what "System sound" sends). Counts 5 ms
+/// dropout blocks (device loopback loud, cable >12 dB quieter) and reports the residual.
+#[test]
+#[ignore]
+fn diag_rapid_dings() {
+    let _g = serial();
+    let wav = std::env::var("AUDIO_EXCLUDE_DING").unwrap_or_else(|_| r"C:\Windows\Media\Windows Background.wav".into());
+    let dummy = start_dummy();
+    let pid = dummy.pid().to_string();
+    for (label, env) in [("without concealment", &[("AUDIO_EXCLUDE_NO_CONCEAL", "1")][..]), ("with concealment", &[][..])] {
+        let _cap = start_capture_env(&["--exclude-pid", &pid], env);
+        thread::sleep(Duration::from_millis(1500));
+        let cable = record(Source::Cable, 6000);
+        let local = record(Source::Local, 6000);
+        thread::sleep(Duration::from_millis(300));
+        let mut ps = Command::new("powershell");
+        ps.args(["-NoProfile", "-Command", &format!("$p = New-Object Media.SoundPlayer '{wav}'; $p.Load(); for ($i = 0; $i -lt 15; $i++) {{ $p.Play(); Start-Sleep -Milliseconds 150 }}; Start-Sleep -Milliseconds 1500")]);
+        assert!(ps.status().unwrap().success());
+        let (cable, local) = (cable.join().unwrap(), local.join().unwrap());
+        let cable_al = align_to(&cable, &local);
+        let Some(on) = local.samples.iter().position(|v| v.abs() > 0.001) else {
+            println!("[diag rapid dings {label}] no ding in device loopback");
+            continue;
+        };
+        let start = on.saturating_sub(480);
+        let n = (RATE as usize * 3).min(local.samples.len() - start);
+        let reference = &local.samples[start..start + n];
+        let delayed = &cable_al[start..(start + n + 9600).min(cable_al.len())];
+        let (lag, corr) = xcorr_lag(reference, delayed, 4800);
+        let m = n.min(delayed.len() - lag);
+        let (num, den) = (0..m).fold((0.0f64, 0.0f64), |(a, b), i| (a + (delayed[i + lag] * reference[i]) as f64, b + (reference[i] * reference[i]) as f64));
+        let gain = (num / den) as f32;
+        let blk = 240;
+        let mut dropouts = Vec::new();
+        for (k, (r, c)) in reference[..m].chunks(blk).zip(delayed[lag..lag + m].chunks(blk)).enumerate() {
+            let (lr, lc) = (audio_exclude::dsp::rms_db(r), audio_exclude::dsp::rms_db(c) - audio_exclude::dsp::to_db(gain));
+            if lr > -40.0 && lc < lr - 12.0 {
+                dropouts.push(k * 5);
+            }
+        }
+        let res: Vec<f32> = (0..m).map(|i| delayed[i + lag] - gain * reference[i]).collect();
+        println!(
+            "[diag rapid dings {label}] lag {:.2} ms, corr {corr:.4}, gain {gain:.3} | signal {:.1} dB, residual {:.1} dB | dropout blocks (5 ms): {} at {:?} | recorder gaps cable {} local {}",
+            lag as f32 * 1000.0 / RATE,
+            audio_exclude::dsp::rms_db(&reference[..m]),
+            audio_exclude::dsp::rms_db(&res),
+            dropouts.len(),
+            &dropouts[..dropouts.len().min(12)],
+            cable.gaps,
+            local.gaps
+        );
+    }
 }

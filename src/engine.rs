@@ -7,6 +7,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::conceal::Concealer;
 use crate::output::{Output, OutputStats};
 use crate::procs;
 use crate::wasapi::{self, CaptureStream};
@@ -249,6 +250,9 @@ fn stream<F: FnMut(Event)>(st: &mut State<F>, rx: &Receiver<Cmd>, out: &Output) 
     (st.emit)(Event::Running);
 
     let mut stats = Stats::new(rate, std::env::var_os("AUDIO_EXCLUDE_STATS").is_some());
+    // AUDIO_EXCLUDE_NO_CONCEAL: pass holes through unconcealed (for A/B comparisons)
+    let conceal_on = std::env::var_os("AUDIO_EXCLUDE_NO_CONCEAL").is_none();
+    let mut conceal = Concealer::new(rate);
     let mut last_resolve = Instant::now();
     loop {
         // commands
@@ -277,6 +281,7 @@ fn stream<F: FnMut(Event)>(st: &mut State<F>, rx: &Receiver<Cmd>, out: &Output) 
             if now != pid || retarget {
                 drop(cap);
                 pid = now;
+                conceal = Concealer::new(rate);
                 cap = match open_loopback(pid, rate) {
                     Ok(c) => c,
                     Err(e) => {
@@ -300,7 +305,15 @@ fn stream<F: FnMut(Event)>(st: &mut State<F>, rx: &Receiver<Cmd>, out: &Output) 
         if cap.wait(Duration::from_millis(50)) {
             let r = cap.read(|p| {
                 stats.packet(p.samples.len() / wasapi::CHANNELS, p.qpc_100ns, p.flags);
-                out.push(p.samples);
+                if conceal_on {
+                    let before = conceal.concealed_frames;
+                    out.push(conceal.process(p.samples, p.qpc_100ns));
+                    if conceal.concealed_frames != before {
+                        stats.concealed(conceal.concealed_frames - before);
+                    }
+                } else {
+                    out.push(p.samples);
+                }
             });
             if let Err(e) = r {
                 (st.emit)(Event::CaptureError(format!("capture read: {e}")));
@@ -409,6 +422,12 @@ impl Stats {
         }
         self.last_qpc = Some(qpc);
         self.prev_arrival = Some(now);
+    }
+
+    fn concealed(&self, frames: u64) {
+        if self.on {
+            self.send(format!("event: concealed {:.1} ms of lost audio (hole and zeros after it)", frames as f64 * 1000.0 / self.rate as f64));
+        }
     }
 
     fn last_pkt_gap_ms(&self, now: Instant) -> f64 {
