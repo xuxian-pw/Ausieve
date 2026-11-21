@@ -57,6 +57,12 @@ fn tone_device() -> Option<String> {
     std::env::var("AUDIO_EXCLUDE_TONE_DEVICE").ok().filter(|s| !s.is_empty())
 }
 
+/// Capture buffer of the test's own loopback recorders (default: the same as capture's,
+/// AUDIO_EXCLUDE_RAW_BUFFER_MS to compare).
+fn raw_buffer_ms() -> i64 {
+    std::env::var("AUDIO_EXCLUDE_RAW_BUFFER_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(wasapi::LOOPBACK_BUFFER_MS)
+}
+
 fn serial() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     static WARM: OnceLock<()> = OnceLock::new();
@@ -266,16 +272,16 @@ fn record(src: Source, ms: u64) -> JoinHandle<Recording> {
         let mut cap = match src {
             Source::Cable => {
                 let dev = wasapi::find_device(&cable_name(), eCapture).unwrap();
-                CaptureStream::from_device(&dev, false, 20).unwrap()
+                CaptureStream::from_device(&dev, false, raw_buffer_ms()).unwrap()
             }
             Source::Local => {
                 let dev = match tone_device() {
                     Some(n) => wasapi::find_device(&n, eRender).unwrap(),
                     None => wasapi::default_device(eRender).unwrap(),
                 };
-                CaptureStream::from_device(&dev, true, 20).unwrap()
+                CaptureStream::from_device(&dev, true, raw_buffer_ms()).unwrap()
             }
-            Source::ProcessLoopback(pid) => CaptureStream::process_loopback(pid, false, 20, SAMPLE_RATE).unwrap(),
+            Source::ProcessLoopback(pid) => CaptureStream::process_loopback(pid, false, raw_buffer_ms(), SAMPLE_RATE).unwrap(),
         };
         ready_tx.send(()).unwrap();
         let mut samples: Vec<f32> = Vec::new();
@@ -544,9 +550,12 @@ fn t6_latency() {
     let _cap = start_capture(&["--exclude-pid", &pid]);
     thread::sleep(Duration::from_millis(300));
     let mut results = Vec::new();
+    // AUDIO_EXCLUDE_T6_DELAY_MS: time between the burst's stream opening and the burst
+    let delay: u64 = std::env::var("AUDIO_EXCLUDE_T6_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(500);
+    let (d, dur) = (delay.to_string(), (delay + 1000).to_string());
     for round in 0..3 {
-        let (cable, local) = record_both(1800);
-        let _b = start_tone(&tone_exe(), F_EXCLUDED, &["--delay", "500", "--burst", "30", "--duration", "1500"]);
+        let (cable, local) = record_both(delay + 1300);
+        let _b = start_tone(&tone_exe(), F_EXCLUDED, &["--delay", &d, "--burst", "30", "--duration", &dur]);
         let (cable, local) = (cable.join().unwrap(), local.join().unwrap());
         let cable_al = align_to(&cable, &local);
         let (lag, coef) = xcorr_lag(&local.samples, &cable_al, (RATE * 0.3) as usize);
@@ -873,7 +882,7 @@ fn diag_glitch_sources() {
     let _t = start_tone(&tone_exe(), F_EXCLUDED, &["--duration", "5000"]);
     thread::sleep(Duration::from_millis(300));
     wasapi::init_com().unwrap();
-    let mut cap = CaptureStream::process_loopback(dummy.pid(), false, 20, SAMPLE_RATE).unwrap();
+    let mut cap = CaptureStream::process_loopback(dummy.pid(), false, raw_buffer_ms(), SAMPLE_RATE).unwrap();
     let mut samples = Vec::new();
     let t = Instant::now();
     while t.elapsed() < Duration::from_millis(4000) {
@@ -927,7 +936,7 @@ fn diag_loopback_vs_other_streams() {
     let _t = start_tone(&tone_exe(), F_EXCLUDED, &["--duration", "6000"]);
     thread::sleep(Duration::from_millis(300));
     wasapi::init_com().unwrap();
-    let mut cap = CaptureStream::process_loopback(dummy.pid(), false, 20, SAMPLE_RATE).unwrap();
+    let mut cap = CaptureStream::process_loopback(dummy.pid(), false, raw_buffer_ms(), SAMPLE_RATE).unwrap();
     let mut samples = Vec::new();
     let t = Instant::now();
     let mut other: Option<Proc> = None;
@@ -1218,7 +1227,7 @@ fn diag_packets_on_stream_open() {
     let _t = start_tone(&tone_exe(), F_EXCLUDED, &["--duration", "6000"]);
     thread::sleep(Duration::from_millis(300));
     wasapi::init_com().unwrap();
-    let mut cap = CaptureStream::process_loopback(dummy.pid(), false, 20, SAMPLE_RATE).unwrap();
+    let mut cap = CaptureStream::process_loopback(dummy.pid(), false, raw_buffer_ms(), SAMPLE_RATE).unwrap();
     let t0 = Instant::now();
     let mut log: Vec<(f64, u64, usize, u32)> = Vec::new();
     let mut samples: Vec<f32> = Vec::new();
@@ -1297,15 +1306,15 @@ fn record_packets(src: Source, ms: u64) -> JoinHandle<PacketRec> {
     let h = thread::spawn(move || {
         wasapi::init_com().unwrap();
         let mut cap = match src {
-            Source::Cable => CaptureStream::from_device(&wasapi::find_device(&cable_name(), eCapture).unwrap(), false, 20).unwrap(),
+            Source::Cable => CaptureStream::from_device(&wasapi::find_device(&cable_name(), eCapture).unwrap(), false, raw_buffer_ms()).unwrap(),
             Source::Local => {
                 let dev = match tone_device() {
                     Some(n) => wasapi::find_device(&n, eRender).unwrap(),
                     None => wasapi::default_device(eRender).unwrap(),
                 };
-                CaptureStream::from_device(&dev, true, 20).unwrap()
+                CaptureStream::from_device(&dev, true, raw_buffer_ms()).unwrap()
             }
-            Source::ProcessLoopback(pid) => CaptureStream::process_loopback(pid, false, 20, SAMPLE_RATE).unwrap(),
+            Source::ProcessLoopback(pid) => CaptureStream::process_loopback(pid, false, raw_buffer_ms(), SAMPLE_RATE).unwrap(),
         };
         ready_tx.send(()).unwrap();
         let mut r = PacketRec { samples: Vec::new(), log: Vec::new() };
@@ -1395,6 +1404,29 @@ fn diag_rapid_streams() {
         println!("[diag rapid] {name} jumps at {:?}
    gaps at {:?}", &ev[..ev.len().min(12)].iter().map(|t| t + 100.0).collect::<Vec<_>>(), &pos[..pos.len().min(6)]);
     }
+    // the raw packets through the timeline logic (offline), like the engine does
+    let mut tl = audio_exclude::timeline::Timeline::new(SAMPLE_RATE);
+    let mut out: Vec<f32> = Vec::new();
+    let mut i = 0;
+    for &(q, n, _) in &raw.log {
+        let pkt: Vec<f32> = raw.samples[i..i + n].iter().flat_map(|v| [*v; CHANNELS]).collect();
+        let (hole, s) = tl.packet(&pkt, q);
+        let mut tail: Vec<f32> = out[out.len().saturating_sub(hole.fade_out)..].iter().flat_map(|v| [*v; CHANNELS]).collect();
+        audio_exclude::timeline::fade_out_tail(&mut tail, hole.fade_out);
+        let at = out.len() - tail.len() / CHANNELS;
+        out.truncate(at);
+        out.extend(tail.chunks(CHANNELS).map(|f| f[0]));
+        out.extend(std::iter::repeat(0.0).take(hole.frames));
+        out.extend(s.chunks(CHANNELS).map(|f| f[0]));
+        i += n;
+    }
+    let (ev, floor) = sine_glitches(&out[RATE as usize / 10..], F_EXCLUDED, 0.005);
+    println!("[diag rapid] timeline offline: {} holes, {} cuts faded, {} hard steps left {:?} (floor {floor:.1} dB), top residuals {}", tl.holes, tl.cuts, ev.len(), &ev[..ev.len().min(8)], top_residuals(&out[RATE as usize / 10..], F_EXCLUDED, 100.0));
+    for &t in ev.iter().take(3) {
+        let c = ((t + 100.0) * RATE / 1000.0) as usize;
+        let w: Vec<String> = out[c.saturating_sub(6)..(c + 6).min(out.len())].iter().map(|v| format!("{v:.4}")).collect();
+        println!("   around {:.1} ms: {}", t + 100.0, w.join(" "));
+    }
     // packets around the first two holes
     let mut pos = 0usize;
     let g: Vec<usize> = raw.timestamp_gaps().iter().map(|g| g.0).take(2).collect();
@@ -1415,17 +1447,6 @@ fn diag_rapid_streams() {
         }
         pos += n;
     }
-    // the same raw packets through the concealer (offline)
-    let mut cc = audio_exclude::conceal::Concealer::new(SAMPLE_RATE);
-    let mut out = Vec::new();
-    let mut i = 0;
-    for &(q, n, _) in &raw.log {
-        let pkt: Vec<f32> = raw.samples[i..i + n].iter().flat_map(|v| [*v; CHANNELS]).collect();
-        out.extend(cc.process(&pkt, q).chunks(CHANNELS).map(|f| f[0]));
-        i += n;
-    }
-    let (ev, floor) = sine_glitches(&out[RATE as usize / 10..], F_EXCLUDED, 0.005);
-    println!("[diag rapid] process loopback concealed offline: {} holes filled, {} waveform jumps left (floor {floor:.1} dB), top residuals {}", cc.concealed, ev.len(), top_residuals(&out[RATE as usize / 10..], F_EXCLUDED, 100.0));
 }
 
 /// One run of the "rapid volume clicks" scenario through capture: a continuous 1000 Hz
@@ -1439,10 +1460,18 @@ fn rapid_clicks_through_capture(env: &[(&str, &str)]) -> Option<(Vec<f32>, usize
     let _cap = start_capture_env(&["--exclude-pid", &pid], env);
     thread::sleep(Duration::from_millis(1000));
     let cable = record(Source::Cable, 5000);
+    let cable2 = record(Source::Cable, 5000);
     let raw = record_packets(Source::ProcessLoopback(dummy.pid()), 5000);
     thread::sleep(Duration::from_millis(700));
     rapid_streams(20, 150, false);
-    let (cable, raw) = (cable.join().unwrap(), raw.join().unwrap());
+    let (cable, cable2, raw) = (cable.join().unwrap(), cable2.join().unwrap(), raw.join().unwrap());
+    {
+        let skip = RATE as usize / 10;
+        let al = align_to(&cable2, &cable);
+        let (e1, _) = sine_glitches(&cable.samples[skip..], F_EXCLUDED, 0.005);
+        let (e2, _) = sine_glitches(&al[skip.min(al.len())..], F_EXCLUDED, 0.005);
+        println!("   [two cable recorders] first: {e1:?} second (same timeline): {e2:?}");
+    }
     if cable.gaps > 0 {
         return None;
     }
@@ -1450,44 +1479,39 @@ fn rapid_clicks_through_capture(env: &[(&str, &str)]) -> Option<(Vec<f32>, usize
     let skip = RATE as usize / 10;
     let (ev, floor) = sine_glitches(&cable.samples[skip..], F_EXCLUDED, 0.005);
     let ev: Vec<f32> = ev.iter().map(|t| t + 100.0).collect();
+    for &t in ev.iter().take(2) {
+        let i = (t * RATE / 1000.0) as usize;
+        let w: Vec<String> = cable.samples[i.saturating_sub(8)..(i + 8).min(cable.samples.len())].iter().map(|v| format!("{v:.4}")).collect();
+        println!("   cable around {t:.1} ms: {}", w.join(" "));
+    }
     let report = format!(
-        "raw process loopback: {holes} holes ({} waveform jumps) | cable: {} glitches {:?}, floor {floor:.1} dB, top residuals {}",
+        "raw process loopback: {holes} holes ({} waveform jumps) | cable: {} glitches {:?}, floor {floor:.1} dB, top residuals {} | cable times relative to qpc {:.1} ms",
         sine_glitches(&raw.samples[skip..], F_EXCLUDED, 0.005).0.len(),
         ev.len(),
         &ev[..ev.len().min(8)],
-        top_residuals(&cable.samples[skip..], F_EXCLUDED, 100.0)
+        top_residuals(&cable.samples[skip..], F_EXCLUDED, 100.0),
+        cable.start_qpc as f64 / 1e4
     );
     Some((ev, holes, report))
 }
 
-/// 13. Rapid clicks on the volume slider (each plays a new ding): every stream another
-/// program opens or closes makes process loopback lose ~40 ms (a timestamp hole, then
-/// zeros). Capture must conceal that: the cable carries the continuous sine without a
-/// single discontinuity above the t10/t11 threshold. The same scenario without
-/// concealment (`AUDIO_EXCLUDE_NO_CONCEAL`) is measured too, proving the scenario
-/// does trigger the losses and the test detects them.
+/// 13. Rapid clicks on the volume slider (each plays a new ding): another stream opens
+/// and closes 20 times while a continuous sine plays. Each time, Windows' process
+/// loopback loses ~40 ms (unrecoverable: capture inserts silence on the timeline), but
+/// the cable must not carry a single hard step (sine-predictor residual above the
+/// t10/t11 threshold): the edges of the lost audio are faded.
 #[test]
 fn t13_rapid_stream_open_close() {
     let _g = serial();
-    for (label, env) in [("without concealment", &[("AUDIO_EXCLUDE_NO_CONCEAL", "1")][..]), ("with concealment", &[][..])] {
-        let (ev, holes, report) = (1..=3).find_map(|_| rapid_clicks_through_capture(env)).expect("cable recorder kept having gaps");
-        println!("[t13 {label}] {report}");
-        assert!(holes >= 10, "[t13 {label}] the scenario lost too little audio to test anything: {holes} holes
-{report}");
-        if env.is_empty() {
-            assert!(ev.is_empty(), "[t13] {} discontinuities in the cable despite concealment: {ev:?}
+    let (ev, holes, report) = (1..=3).find_map(|_| rapid_clicks_through_capture(&[])).expect("cable recorder kept having gaps");
+    println!("[t13] {report}");
+    assert!(ev.is_empty(), "[t13] {} discontinuities in the cable ({holes} holes in raw process loopback): {ev:?}
 {report}", ev.len());
-        } else {
-            assert!(!ev.is_empty(), "[t13] without concealment the cable should show the losses
-{report}");
-        }
-        thread::sleep(Duration::from_millis(300));
-    }
 }
 
 /// Diagnostic (ignored): the real thing. A ding (`AUDIO_EXCLUDE_DING`, default
 /// Windows Background.wav) restarted 15 times every 150 ms (`SoundPlayer.Play()`, like
-/// rapid clicks on the volume slider), through capture with and without concealment.
+/// rapid clicks on the volume slider), through capture.
 /// The cable is compared with device loopback (what "System sound" sends). Counts 5 ms
 /// dropout blocks (device loopback loud, cable >12 dB quieter) and reports the residual.
 #[test]
@@ -1497,7 +1521,7 @@ fn diag_rapid_dings() {
     let wav = std::env::var("AUDIO_EXCLUDE_DING").unwrap_or_else(|_| r"C:\Windows\Media\Windows Background.wav".into());
     let dummy = start_dummy();
     let pid = dummy.pid().to_string();
-    for (label, env) in [("without concealment", &[("AUDIO_EXCLUDE_NO_CONCEAL", "1")][..]), ("with concealment", &[][..])] {
+    for (label, env) in [("capture", &[][..])] {
         let _cap = start_capture_env(&["--exclude-pid", &pid], env);
         thread::sleep(Duration::from_millis(1500));
         let cable = record(Source::Cable, 6000);
@@ -1581,7 +1605,7 @@ impl PacketRec {
 /// Background.wav), (a) after silence and (b) while a continuous 1000 Hz sine plays.
 /// Locates, on the QPC timeline relative to the ding's start/end in device loopback,
 /// where process loopback has timestamp holes and runs of zeros. Then compares the
-/// cable (through capture, with and without concealment) with device loopback.
+/// cable (through capture) with device loopback.
 #[test]
 #[ignore]
 fn diag_single_ding() {
@@ -1589,16 +1613,13 @@ fn diag_single_ding() {
     let wav = std::env::var("AUDIO_EXCLUDE_DING").unwrap_or_else(|_| r"C:\Windows\Media\Windows Background.wav".into());
     let dummy = start_dummy();
     let pid = dummy.pid().to_string();
-    // AUDIO_EXCLUDE_CASE=sine: only the case over a sine, without concealment
+    // AUDIO_EXCLUDE_CASE=sine: only the case over a sine
     let only_sine = std::env::var("AUDIO_EXCLUDE_CASE").is_ok_and(|v| v == "sine");
     for with_sine in [false, true] {
         if only_sine && !with_sine {
             continue;
         }
-        for (label, env) in [("no concealment", &[("AUDIO_EXCLUDE_NO_CONCEAL", "1")][..]), ("concealment", &[][..])] {
-            if only_sine && env.is_empty() {
-                continue;
-            }
+        for (label, env) in [("capture", &[][..])] {
             let case = format!("{} / {label}", if with_sine { "over a sine" } else { "after silence" });
             let _t = with_sine.then(|| start_tone(&tone_exe(), F_EXCLUDED, &["--duration", "9000"]));
             let _cap = start_capture_env(&["--exclude-pid", &pid], env);
@@ -1674,10 +1695,11 @@ fn diag_single_ding() {
                 .map(|(d, k)| format!("{}:{d:+.0}dB", rel(dev.qpc_ms_at(start + k * blk))))
                 .collect();
             println!(
-                "    cable vs device loopback: lag {:.2} ms, corr {corr:.4}, gain {gain:.3}, residual {:.1} dB rel. signal | 5 ms dropout blocks {} {dropouts:?} | blocks with residual > -10 dB rel. {worst:?}",
+                "    cable vs device loopback: lag {:.2} ms, corr {corr:.4}, gain {gain:.3}, residual {:.1} dB rel. signal | 5 ms dropout blocks {} {dropouts:?} | cable recorder holes {:?} | blocks with residual > -10 dB rel. {worst:?}",
                 lag as f32 * 1000.0 / RATE,
                 audio_exclude::dsp::rms_db(&res) - audio_exclude::dsp::rms_db(reference),
-                dropouts.len()
+                dropouts.len(),
+                cable.timestamp_gaps().iter().map(|g| (rel(g.1), (g.2 * 10.0).round() / 10.0)).collect::<Vec<_>>()
             );
             thread::sleep(Duration::from_millis(300));
         }

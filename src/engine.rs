@@ -7,9 +7,9 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::conceal::Concealer;
 use crate::output::{Output, OutputStats};
 use crate::procs;
+use crate::timeline::Timeline;
 use crate::wasapi::{self, CaptureStream};
 
 /// Default jitter-buffer start level (see [`Output::open`]). Process loopback delivers
@@ -198,7 +198,7 @@ fn open_loopback(target: Option<u32>, rate: u32) -> Result<CaptureStream, String
     // EXCLUDE mode needs some PID; with nothing to exclude we exclude ourselves, which
     // removes nothing (our only output is an exclusive stream that loopback can't see).
     let pid = target.unwrap_or_else(std::process::id);
-    CaptureStream::process_loopback(pid, false, 20, rate)
+    CaptureStream::process_loopback(pid, false, wasapi::LOOPBACK_BUFFER_MS, rate)
         .map_err(|e| format!("process loopback activation (pid {pid}) failed: {e}"))
 }
 
@@ -250,9 +250,9 @@ fn stream<F: FnMut(Event)>(st: &mut State<F>, rx: &Receiver<Cmd>, out: &Output) 
     (st.emit)(Event::Running);
 
     let mut stats = Stats::new(rate, std::env::var_os("AUDIO_EXCLUDE_STATS").is_some());
-    // AUDIO_EXCLUDE_NO_CONCEAL: pass holes through unconcealed (for A/B comparisons)
-    let conceal_on = std::env::var_os("AUDIO_EXCLUDE_NO_CONCEAL").is_none();
-    let mut conceal = Concealer::new(rate);
+    // AUDIO_EXCLUDE_NO_TIMELINE: join packets end to end as before (for A/B comparisons)
+    let timeline_on = std::env::var_os("AUDIO_EXCLUDE_NO_TIMELINE").is_none();
+    let mut timeline = Timeline::new(rate);
     let mut last_resolve = Instant::now();
     loop {
         // commands
@@ -281,7 +281,7 @@ fn stream<F: FnMut(Event)>(st: &mut State<F>, rx: &Receiver<Cmd>, out: &Output) 
             if now != pid || retarget {
                 drop(cap);
                 pid = now;
-                conceal = Concealer::new(rate);
+                timeline = Timeline::new(rate);
                 cap = match open_loopback(pid, rate) {
                     Ok(c) => c,
                     Err(e) => {
@@ -305,12 +305,13 @@ fn stream<F: FnMut(Event)>(st: &mut State<F>, rx: &Receiver<Cmd>, out: &Output) 
         if cap.wait(Duration::from_millis(50)) {
             let r = cap.read(|p| {
                 stats.packet(p.samples.len() / wasapi::CHANNELS, p.qpc_100ns, p.flags);
-                if conceal_on {
-                    let before = conceal.concealed_frames;
-                    out.push(conceal.process(p.samples, p.qpc_100ns));
-                    if conceal.concealed_frames != before {
-                        stats.concealed(conceal.concealed_frames - before);
+                if timeline_on {
+                    let (hole, s) = timeline.packet(p.samples, p.qpc_100ns);
+                    if hole.frames > 0 || hole.fade_out > 0 {
+                        let queued = out.push_hole(hole.frames, hole.fade_out);
+                        stats.hole(hole.frames, hole.fade_out, queued);
                     }
+                    out.push(s);
                 } else {
                     out.push(p.samples);
                 }
@@ -424,9 +425,15 @@ impl Stats {
         self.prev_arrival = Some(now);
     }
 
-    fn concealed(&self, frames: u64) {
+    fn hole(&self, frames: usize, fade_out: usize, queued: usize) {
         if self.on {
-            self.send(format!("event: concealed {:.1} ms of lost audio (hole and zeros after it)", frames as f64 * 1000.0 / self.rate as f64));
+            let q = if queued == usize::MAX { "after an underrun".to_string() } else { format!("{queued} frames still queued for the fade-out") };
+            self.send(format!(
+                "event: at qpc {:.1} ms inserted {:.1} ms of silence for lost audio{}",
+                wasapi::qpc_now_100ns() as f64 / 10_000.0,
+                frames as f64 * 1000.0 / self.rate as f64,
+                if fade_out > 0 { format!(", edges faded ({q})") } else { String::new() }
+            ));
         }
     }
 
@@ -455,7 +462,7 @@ impl Stats {
         }
         let ms = |f: f64| f * 1000.0 / self.rate as f64;
         let line = format!(
-            "stats: {} pkts {:.1}-{:.1} ms, max gap {:.1} ms, max capture delay {:.1} ms, discontinuities {} | jitter buffer after push {:.1}-{:.1} ms, underruns {}, silence {:.1} ms, dropped {:.1} ms, device pulled {:.1} ms",
+            "stats: {} pkts {:.1}-{:.1} ms, max gap {:.1} ms, max capture delay {:.1} ms, discontinuities {} | jitter buffer after push {:.1}-{:.1} ms, underruns {}, silence {:.1} ms, dropped {:.1} ms, device pulled {:.1} ms | avg level {:.1} ms (target {:.1}), speed {:.5}, resampled {:.1} ms",
             self.packets,
             ms(self.min_pkt as f64),
             ms(self.max_pkt as f64),
@@ -468,6 +475,10 @@ impl Stats {
             ms((o.silent_frames - self.prev.silent_frames) as f64),
             ms((o.dropped_frames - self.prev.dropped_frames) as f64),
             ms((o.pulled_frames - self.prev.pulled_frames) as f64),
+            ms(o.avg_level),
+            ms(o.target_level),
+            o.speed,
+            ms((o.corrected_frames - self.prev.corrected_frames) as f64),
         );
         if let Some(p) = &self.printer {
             let _ = p.send(line);

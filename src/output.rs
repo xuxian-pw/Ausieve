@@ -23,12 +23,12 @@ use crate::wasapi::{self, ExclusiveMode, ExclusiveRender, CHANNELS, HNS_PER_MS};
 /// output thread. Only LOW_WATER_MS..FILL_MS of it is normally in use.
 const DEVICE_BUFFER_MS: i64 = 30;
 /// Top the device buffer up when it holds less than this...
-const LOW_WATER_MS: u32 = 4;
+const LOW_WATER_MS: u32 = 5;
 /// ...to this level. Average device-side latency is about (LOW_WATER_MS + FILL_MS) / 2.
-const FILL_MS: u32 = 6;
+const FILL_MS: u32 = 7;
 /// Below this the device is about to run dry: pad with silence rather than let it
 /// replay stale buffer contents.
-const CRITICAL_MS: u32 = 2;
+const CRITICAL_MS: u32 = 3;
 
 /// Fade-in after (re)starting playback, so audio never starts with a step.
 const FADE_MS: u32 = 3;
@@ -162,6 +162,30 @@ impl Jitter {
         }
     }
 
+    /// A hole in the capture timeline (audio Windows lost): fades out the last
+    /// `fade_out` queued frames (not yet played), then queues `frames` of silence in
+    /// place of the lost audio, so the level (and thus the timeline) is kept.
+    /// Returns the frames that were still queued (could be faded).
+    pub fn push_hole(&mut self, frames: usize, fade_out: usize) -> usize {
+        let q = self.frames();
+        let n = fade_out.min(q);
+        let (a, b) = self.buf.as_mut_slices();
+        let mut tail: Vec<f32> = a.iter().chain(b.iter()).skip((q - n) * CHANNELS).copied().collect();
+        crate::timeline::fade_out_tail(&mut tail, n);
+        let start = (q - n) * CHANNELS;
+        for (i, v) in tail.into_iter().enumerate() {
+            self.buf[start + i] = v;
+        }
+        self.buf.extend(std::iter::repeat(0.0).take(frames * CHANNELS));
+        let n = self.frames();
+        if n > self.max {
+            let drop = n - self.start;
+            self.buf.drain(..drop * CHANNELS);
+            self.dropped_frames += drop as u64;
+        }
+        q
+    }
+
     /// Target of the average level: the level oscillates between `start` (packet just
     /// arrived) and `start - packet`, so its average is about half a packet lower.
     fn target_level(&self) -> f64 {
@@ -287,8 +311,12 @@ impl Jitter {
             }
             self.prime();
         }
+        // Without must_fill, the last fade_len frames stay queued: if the next packet
+        // reports lost audio, they can still be faded out (see push_hole); if the
+        // device is about to run dry (must_fill), they are played, faded out.
+        let reserve = if must_fill { 0 } else { self.fade_len };
         let mut n = 0;
-        while n < want && self.frames() >= self.needed() {
+        while n < want && self.frames() >= self.needed() + reserve {
             let g = if self.fade_pos < self.fade_len {
                 self.fade_pos += 1;
                 self.fade_pos as f32 / self.fade_len as f32
@@ -308,6 +336,10 @@ impl Jitter {
                 self.prev[c] = out[n * CHANNELS + c];
             }
             n += 1;
+        }
+        if must_fill && n < want {
+            // running dry: end softly instead of cutting off
+            crate::timeline::fade_out_tail(&mut out[..n * CHANNELS], self.fade_len);
         }
         if n > 0 {
             self.steer(n);
@@ -335,6 +367,10 @@ pub struct OutputStats {
     pub silent_frames: u64,
     pub pulled_frames: u64,
     pub queued_frames: usize,
+    pub speed: f64,
+    pub avg_level: f64,
+    pub target_level: f64,
+    pub corrected_frames: u64,
 }
 
 /// A running exclusive output stream.
@@ -442,6 +478,16 @@ impl Output {
         self.jitter.lock().unwrap().push(interleaved);
     }
 
+    /// See [`Jitter::push_hole`].
+    pub fn push_hole(&self, frames: usize, fade_out: usize) -> usize {
+        let mut j = self.jitter.lock().unwrap();
+        let q = j.push_hole(frames, fade_out);
+        if !j.primed {
+            return usize::MAX; // after an underrun
+        }
+        q
+    }
+
     /// Silence dither: when on, a faint +-1 LSB noise (about -90 dBFS) is added to
     /// everything written, so the device never carries exact digital zeros. Some
     /// consumers (e.g. RustDesk's audio encoder) stop after a run of all-zero frames and
@@ -463,6 +509,10 @@ impl Output {
             silent_frames: j.silent_frames,
             pulled_frames: j.pulled_frames,
             queued_frames: j.frames(),
+            speed: j.speed,
+            avg_level: j.avg_level,
+            target_level: j.target_level(),
+            corrected_frames: j.corrected_frames,
         }
     }
 }
@@ -514,15 +564,23 @@ mod tests {
     }
 
     #[test]
-    fn pull_upto_without_must_fill_never_inserts_silence() {
-        let mut j = Jitter::new(10, 1000, 48_000);
-        let mut out = frames(48, 9.0);
+    fn pull_upto_without_must_fill_never_inserts_silence_and_keeps_a_fade_reserve() {
+        let mut j = Jitter::new(400, 10_000, 48_000);
+        let mut out = frames(1000, 9.0);
         assert_eq!(j.pull_upto(&mut out, false), 0, "not primed yet");
-        j.push(&frames(30, 1.0)); // primes at 10
-        assert_eq!(j.pull_upto(&mut out, false), 10);
+        j.push(&frames(500, 1.0)); // primes at 400
+        // the last 3 ms (144 frames) stay queued for a possible fade-out
+        assert_eq!(j.pull_upto(&mut out, false), 400 - 144);
         assert_eq!(j.underruns, 0);
         assert_eq!(j.pull_upto(&mut out, false), 0);
         assert_eq!(j.underruns, 0, "an empty queue is not an underrun while the device has slack");
+        // the device is about to run dry: the reserve is played, faded out, then silence
+        let mut out = frames(300, 9.0);
+        assert_eq!(j.pull_upto(&mut out, true), 300);
+        assert_eq!(j.underruns, 1);
+        let l: Vec<f32> = out.chunks(CHANNELS).map(|f| f[0]).collect();
+        assert!(l[0] > 0.99 && l[143] < 0.01 && l[1..144].windows(2).all(|w| w[1] <= w[0]), "fade-out over the reserve");
+        assert!(l[144..].iter().all(|v| *v == 0.0));
     }
 
     /// Simulates capture (10 ms packets of a 1 kHz sine, with optional losses) and the
@@ -574,6 +632,74 @@ mod tests {
     fn glitches(x: &[f32]) -> Vec<usize> {
         let c = 2.0 * (2.0 * std::f32::consts::PI * 1000.0 / 48_000.0).cos();
         (2..x.len()).filter(|&n| (x[n] - c * x[n - 1] + x[n - 2]).abs() > 0.005).collect()
+    }
+
+    /// The real chain around lost audio: capture packets every 10 ms through
+    /// [`Timeline`](crate::timeline::Timeline), the jitter buffer, and a device modelled
+    /// like the output thread (topped up to FILL_MS below LOW_WATER_MS, must_fill below
+    /// CRITICAL_MS). At each event in `events` (ms), the packet of that slot is lost
+    /// (arrives as the next one, timestamp 10 ms further) and the 31 ms after it are exact
+    /// zeros, as measured on stream open/close. Returns what the device played.
+    fn simulate_device(start_ms: usize, ms_total: usize, events: &[usize], arrive: usize) -> (Vec<f32>, Jitter) {
+        let rate = 48_000u32;
+        let mut j = Jitter::new(rate as usize * start_ms / 1000, rate as usize * (start_ms + 20) / 1000, rate);
+        let mut tl = crate::timeline::Timeline::new(rate);
+        let w = 2.0 * std::f64::consts::PI * 1000.0 / rate as f64;
+        let (low, fill, critical) = (LOW_WATER_MS as usize * 48, FILL_MS as usize * 48, CRITICAL_MS as usize * 48);
+        let mut dev_level = fill; // frames queued in the device
+        let mut played = Vec::new();
+        let mut zeros_until = 0u64;
+        for ms in 0..ms_total {
+            if ms % 10 == arrive {
+                let slot = ms / 10;
+                let src = slot as u64 * 480;
+                if !events.iter().any(|&e| e + arrive == ms) {
+                    if events.iter().any(|&e| e + 10 + arrive == ms) {
+                        zeros_until = src + 31 * 48;
+                    }
+                    let pkt: Vec<f32> = (src..src + 480).flat_map(|i| {
+                        let v = if i < zeros_until { 0.0 } else { (0.1 * (w * i as f64).sin()) as f32 };
+                        [v, v]
+                    }).collect();
+                    let qpc = src * 10_000_000 / 48_000 + 77_777;
+                    let (hole, s) = tl.packet(&pkt, qpc);
+                    if hole.frames > 0 || hole.fade_out > 0 {
+                        j.push_hole(hole.frames, hole.fade_out);
+                    }
+                    j.push(s);
+                }
+            }
+            // the device plays 1 ms, the output thread tops it up
+            let take = dev_level.min(48);
+            dev_level -= take;
+            played.extend(std::iter::repeat(f32::NAN).take(take)); // placeholder, filled below
+            if dev_level < low {
+                let mut chunk = vec![0.0f32; (fill - dev_level) * CHANNELS];
+                let n = j.pull_upto(&mut chunk, dev_level < critical);
+                dev_queue_push(&mut played, &chunk[..n * CHANNELS]);
+                dev_level += n;
+            }
+        }
+        (played.into_iter().filter(|v| !v.is_nan()).collect(), j)
+    }
+
+    /// (Device output order is what matters: append the written frames.)
+    fn dev_queue_push(played: &mut Vec<f32>, interleaved: &[f32]) {
+        played.extend(interleaved.chunks(CHANNELS).map(|f| f[0]));
+    }
+
+    #[test]
+    fn lost_audio_through_the_whole_chain_has_no_hard_step() {
+        for phase in 0..10 {
+            // open and close of another stream every 150 ms (as in t13)
+            let events: Vec<usize> = (0..10).flat_map(|k| [1000 + k * 150, 1060 + k * 150]).collect();
+            let (out, j) = simulate_device(20, 3500, &events, phase);
+            let c = 2.0 * (2.0 * std::f32::consts::PI * 1000.0 / 48_000.0).cos();
+            let skip = 48 * 200;
+            let worst = (skip..out.len()).map(|n| ((out[n] - c * out[n - 1] + out[n - 2]).abs(), n)).fold((0.0f32, 0), |m, v| if v.0 > m.0 { v } else { m });
+            println!("phase {phase}: residual {} underruns {}", worst.0, j.underruns);
+            assert!(worst.0 < 0.005, "phase {phase}: residual {} at frame {} ({} underruns)", worst.0, worst.1, j.underruns);
+        }
     }
 
     #[test]

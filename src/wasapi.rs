@@ -29,6 +29,12 @@ pub const HNS_PER_MS: i64 = 10_000;
 const BUFFERFLAGS_SILENT: u32 = 0x2;
 pub const BUFFERFLAGS_DISCONTINUITY: u32 = 0x1;
 
+/// Capacity of loopback capture buffers. It is only a capacity: the stream is drained
+/// on every event, so it adds no latency. It must survive the engine delivering late
+/// (other programs opening or closing streams stall it for tens of ms). OBS and
+/// win-capture-audio use 5 s as well.
+pub const LOOPBACK_BUFFER_MS: i64 = 5000;
+
 /// Initialises COM (multithreaded apartment) for the calling thread.
 pub fn init_com() -> Result<()> {
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() }

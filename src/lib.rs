@@ -5,10 +5,10 @@
 //! * [`procs`]: process enumeration and "root process of a name" resolution.
 //! * [`dsp`]: tiny signal-analysis helpers (Goertzel level meter).
 
-pub mod conceal;
 pub mod config;
 pub mod dsp;
 pub mod engine;
 pub mod output;
 pub mod procs;
+pub mod timeline;
 pub mod wasapi;
