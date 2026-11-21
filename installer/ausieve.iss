@@ -52,9 +52,8 @@ Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreve
 ; Leftovers from before the rename (audio-exclude, tray.exe); same AppId, so this is an
 ; upgrade. The old tray.exe is stopped in PrepareToInstall below.
 Type: files; Name: "{app}\tray.exe"
-; 0.1.0 also installed the README, 0.1.1 the diagnostics script (now only on GitHub).
+; 0.1.0 also installed the README.
 Type: files; Name: "{app}\README.md"
-Type: files; Name: "{app}\diagnose.ps1"
 Type: files; Name: "{userstartup}\audio-exclude.lnk"
 Type: files; Name: "{autodesktop}\audio-exclude.lnk"
 Type: files; Name: "{group}\audio-exclude.lnk"
