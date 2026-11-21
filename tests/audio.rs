@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! tone.exe A (1000 Hz, excluded) ─┐
-//! tone.exe B ( 440 Hz, kept)     ─┼─► tone device (default playback, or AUDIO_EXCLUDE_TONE_DEVICE)
+//! tone.exe B ( 440 Hz, kept)     ─┼─► tone device (default playback, or AUSIEVE_TONE_DEVICE)
 //!                                 │
 //!            process loopback (EXCLUDE A's tree) ─► capture.exe ─► cable playback (exclusive)
 //!                                                                     │
@@ -19,12 +19,12 @@
 //! Run with `cargo test -- --nocapture` to see the measured values.
 //!
 //! Environment variables:
-//! * `AUDIO_EXCLUDE_CABLE`        cable name (default `Line 1 (Virtual Audio Cable)`)
-//! * `AUDIO_EXCLUDE_TONE_DEVICE`  playback device for the test tones (default: system
+//! * `AUSIEVE_CABLE`        cable name (default `Line 1 (Virtual Audio Cable)`)
+//! * `AUSIEVE_TONE_DEVICE`  playback device for the test tones (default: system
 //!   default). Pointing this at a spare cable (e.g. `Line 2 (Virtual Audio Cable)`) makes
 //!   the tests silent and avoids the endpoint's sound enhancements.
-//! * `AUDIO_EXCLUDE_MAX_LATENCY_MS` latency threshold (default 50)
-//! * `AUDIO_EXCLUDE_DUMP=1`       print 10 ms envelopes in the feedback test
+//! * `AUSIEVE_MAX_LATENCY_MS` latency threshold (default 50)
+//! * `AUSIEVE_DUMP=1`       print 10 ms envelopes in the feedback test
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -34,10 +34,10 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use audio_exclude::config::Config;
-use audio_exclude::dsp::{tone_level_db, tone_level_db_near};
-use audio_exclude::engine::{Engine, Event, Target};
-use audio_exclude::wasapi::{self, CaptureStream, CHANNELS, SAMPLE_RATE};
+use ausieve::config::Config;
+use ausieve::dsp::{tone_level_db, tone_level_db_near};
+use ausieve::engine::{Engine, Event, Target};
+use ausieve::wasapi::{self, CaptureStream, CHANNELS, SAMPLE_RATE};
 use rustfft::{num_complex::Complex, FftPlanner};
 use windows::Win32::Media::Audio::{eCapture, eRender};
 
@@ -50,17 +50,17 @@ const REQUIRED_SUPPRESSION_DB: f32 = 40.0;
 const EXCLUDED_NAME: &str = "excluded_app.exe";
 
 fn cable_name() -> String {
-    std::env::var("AUDIO_EXCLUDE_CABLE").unwrap_or_else(|_| "Line 1 (Virtual Audio Cable)".into())
+    std::env::var("AUSIEVE_CABLE").unwrap_or_else(|_| "Line 1 (Virtual Audio Cable)".into())
 }
 
 fn tone_device() -> Option<String> {
-    std::env::var("AUDIO_EXCLUDE_TONE_DEVICE").ok().filter(|s| !s.is_empty())
+    std::env::var("AUSIEVE_TONE_DEVICE").ok().filter(|s| !s.is_empty())
 }
 
 /// Capture buffer of the test's own loopback recorders (default: the same as capture's,
-/// AUDIO_EXCLUDE_RAW_BUFFER_MS to compare).
+/// AUSIEVE_RAW_BUFFER_MS to compare).
 fn raw_buffer_ms() -> i64 {
-    std::env::var("AUDIO_EXCLUDE_RAW_BUFFER_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(wasapi::LOOPBACK_BUFFER_MS)
+    std::env::var("AUSIEVE_RAW_BUFFER_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(wasapi::LOOPBACK_BUFFER_MS)
 }
 
 fn serial() -> MutexGuard<'static, ()> {
@@ -82,7 +82,7 @@ fn warm_up() {
     let mut quiet_since: Option<Instant> = None;
     while t0.elapsed() < Duration::from_secs(10) {
         let r = record(Source::ProcessLoopback(std::process::id()), 250).join().unwrap();
-        if audio_exclude::dsp::rms_db(&r.samples) < -90.0 {
+        if ausieve::dsp::rms_db(&r.samples) < -90.0 {
             let q = *quiet_since.get_or_insert_with(Instant::now);
             if q.elapsed() >= Duration::from_millis(500) {
                 break;
@@ -227,12 +227,12 @@ fn start_capture_env(args: &[&str], env: &[(&str, &str)]) -> Proc {
     let cable = cable_name();
     let mut all: Vec<&str> = args.to_vec();
     all.extend(["--output", cable.as_str()]);
-    let buf = std::env::var("AUDIO_EXCLUDE_BUFFER_MS").unwrap_or_default();
+    let buf = std::env::var("AUSIEVE_BUFFER_MS").unwrap_or_default();
     if !buf.is_empty() {
         all.extend(["--buffer-ms", buf.as_str()]);
     }
-    // AUDIO_EXCLUDE_CAPTURE_EXE: run the tests against another build (A/B comparisons)
-    let exe = std::env::var_os("AUDIO_EXCLUDE_CAPTURE_EXE").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_capture")));
+    // AUSIEVE_CAPTURE_EXE: run the tests against another build (A/B comparisons)
+    let exe = std::env::var_os("AUSIEVE_CAPTURE_EXE").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_capture")));
     let mut cmd = Command::new(&exe);
     cmd.args(&all).envs(env.iter().copied());
     let mut p = Proc::spawn_cmd(cmd);
@@ -460,7 +460,7 @@ fn t3_no_feedback_loop() {
     let cable_al = align_to(&cable, &local);
     let env_c = envelope(&cable_al, win, F_KEPT);
     let env_l = envelope(&local.samples, win, F_KEPT);
-    if std::env::var("AUDIO_EXCLUDE_DUMP").is_ok() {
+    if std::env::var("AUSIEVE_DUMP").is_ok() {
         let f = |e: &[f32]| e.iter().map(|v| format!("{v:.0}")).collect::<Vec<_>>().join(" ");
         println!("[t3] local 10 ms envelope: {}", f(&env_l));
         println!("[t3] cable 10 ms envelope: {}", f(&env_c));
@@ -544,14 +544,14 @@ fn t5_exclusion_covers_child_process() {
 #[test]
 fn t6_latency() {
     let _g = serial();
-    let max_ms: f32 = std::env::var("AUDIO_EXCLUDE_MAX_LATENCY_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(50.0);
+    let max_ms: f32 = std::env::var("AUSIEVE_MAX_LATENCY_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(50.0);
     let dummy = start_dummy();
     let pid = dummy.pid().to_string();
     let _cap = start_capture(&["--exclude-pid", &pid]);
     thread::sleep(Duration::from_millis(300));
     let mut results = Vec::new();
-    // AUDIO_EXCLUDE_T6_DELAY_MS: time between the burst's stream opening and the burst
-    let delay: u64 = std::env::var("AUDIO_EXCLUDE_T6_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(500);
+    // AUSIEVE_T6_DELAY_MS: time between the burst's stream opening and the burst
+    let delay: u64 = std::env::var("AUSIEVE_T6_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(500);
     let (d, dur) = (delay.to_string(), (delay + 1000).to_string());
     for round in 0..3 {
         let (cable, local) = record_both(delay + 1300);
@@ -617,9 +617,9 @@ mod tray_win {
 
     /// The tray's hidden top-level window.
     pub fn find() -> Option<HWND> {
-        unsafe { FindWindowW(w!("audio-exclude-tray"), None).ok() }
+        unsafe { FindWindowW(w!("ausieve-tray"), None).ok() }
     }
-    /// Same command IDs as the tray menu (see src/bin/tray.rs).
+    /// Same command IDs as the tray menu (see src/bin/Ausieve.rs).
     pub const ID_NONE: usize = 1;
     pub const ID_PROGRAM: usize = 1000;
     pub fn command(h: HWND, id: usize) {
@@ -628,7 +628,7 @@ mod tray_win {
     /// Simulates a right click on the tray icon (opens the real popup menu), then
     /// cancels the menu. Exercises menu construction; the click itself is not automated.
     pub fn open_and_cancel_menu(h: HWND) {
-        const WM_TRAY: u32 = 0x8000 + 1; // WM_APP + 1, see tray.rs
+        const WM_TRAY: u32 = 0x8000 + 1; // WM_APP + 1, see Ausieve.rs
         const WM_RBUTTONUP: isize = 0x0205;
         const WM_CANCELMODE: u32 = 0x001F;
         unsafe {
@@ -674,8 +674,8 @@ fn t8_tray_restores_config_and_switches() {
 
     let a = start_tone(&excluded, F_EXCLUDED, &["--duration", "15000"]);
     let _b = start_tone(&tone_exe(), F_KEPT, &["--duration", "15000"]);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tray"));
-    cmd.env("AUDIO_EXCLUDE_CONFIG", &cfg_path);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_Ausieve"));
+    cmd.env("AUSIEVE_CONFIG", &cfg_path);
     let mut tray = Proc::spawn_cmd(cmd);
     let deadline = Instant::now() + Duration::from_secs(5);
     let h = loop {
@@ -781,7 +781,7 @@ fn sine_glitches(x: &[f32], freq: f32, thresh: f32) -> (Vec<f32>, f32) {
             last = Some(n);
         }
     }
-    let floor = audio_exclude::dsp::to_db((sum / x.len().max(1) as f64).sqrt() as f32);
+    let floor = ausieve::dsp::to_db((sum / x.len().max(1) as f64).sqrt() as f32);
     (events, floor)
 }
 
@@ -895,14 +895,14 @@ fn diag_glitch_sources() {
 }
 
 /// Diagnostic (ignored): a synthetic sine pushed straight into our exclusive Output
-/// (no process loopback), recorded from the cable. Periods via AUDIO_EXCLUDE_PERIOD_MS.
+/// (no process loopback), recorded from the cable. Periods via AUSIEVE_PERIOD_MS.
 #[test]
 #[ignore]
 fn diag_exclusive_output_alone() {
     let _g = serial();
     let cable = record(Source::Cable, 4500);
     thread::sleep(Duration::from_millis(300));
-    let out = audio_exclude::output::Output::open(&cable_name(), 15).unwrap();
+    let out = ausieve::output::Output::open(&cable_name(), 15).unwrap();
     let w = 2.0 * std::f64::consts::PI * F_EXCLUDED as f64 / out.rate as f64;
     let mut n: u64 = 0;
     let t0 = Instant::now();
@@ -983,14 +983,14 @@ fn diag_sound_on_capture_open() {
     drop(c1.join());
     drop(cap);
     let env = |r: &Recording| -> String {
-        r.samples.chunks(RATE as usize / 10).map(|c| format!("{:.0}", audio_exclude::dsp::rms_db(c))).collect::<Vec<_>>().join(" ")
+        r.samples.chunks(RATE as usize / 10).map(|c| format!("{:.0}", ausieve::dsp::rms_db(c))).collect::<Vec<_>>().join(" ")
     };
     println!("[diag alert] raw loopback 100 ms RMS: {}", env(&raw));
     println!("[diag alert] local output 100 ms RMS: {}", env(&local));
 }
 
 /// Diagnostic (ignored): the real volume-preview "ding" (the `.Default` system sound,
-/// `AUDIO_EXCLUDE_DING` or `C:\Windows\Media\Windows Background.wav`) after 5 s of
+/// `AUSIEVE_DING` or `C:\Windows\Media\Windows Background.wav`) after 5 s of
 /// silence. Records the cable and the raw process loopback, aligns them sample-exactly
 /// and reports peaks, clipped samples, the cable-minus-reference residual, and whether
 /// the cable carries exact digital zeros while nothing plays.
@@ -998,11 +998,11 @@ fn diag_sound_on_capture_open() {
 #[ignore]
 fn diag_ding() {
     let _g = serial();
-    let wav = std::env::var("AUDIO_EXCLUDE_DING").unwrap_or_else(|_| r"C:\Windows\Media\Windows Background.wav".into());
+    let wav = std::env::var("AUSIEVE_DING").unwrap_or_else(|_| r"C:\Windows\Media\Windows Background.wav".into());
     let dummy = start_dummy();
     let pid = dummy.pid().to_string();
-    // AUDIO_EXCLUDE_USE_RUNNING=1: measure an already running capture/tray instead
-    let cap = std::env::var_os("AUDIO_EXCLUDE_USE_RUNNING").is_none().then(|| start_capture(&["--exclude-pid", &pid]));
+    // AUSIEVE_USE_RUNNING=1: measure an already running capture/tray instead
+    let cap = std::env::var_os("AUSIEVE_USE_RUNNING").is_none().then(|| start_capture(&["--exclude-pid", &pid]));
     for round in 1..=3 {
         thread::sleep(Duration::from_secs(5));
         let cable = record(Source::Cable, 4500);
@@ -1038,21 +1038,21 @@ fn diag_ding() {
         let (num, den) = (0..m).fold((0.0f64, 0.0f64), |(a, b), i| (a + (delayed[i + lag] * reference[i]) as f64, b + (reference[i] * reference[i]) as f64));
         let gain = (num / den) as f32;
         let res: Vec<f32> = (0..m).map(|i| delayed[i + lag] - gain * reference[i]).collect();
-        let sig_rms = audio_exclude::dsp::rms_db(&reference[..m]);
-        let res_rms = audio_exclude::dsp::rms_db(&res);
+        let sig_rms = ausieve::dsp::rms_db(&reference[..m]);
+        let res_rms = ausieve::dsp::rms_db(&res);
         let res_peak = peak(&res);
         // where is the residual largest (10 ms blocks above -60 dB)
         let bad: Vec<String> = res
             .chunks(480)
             .enumerate()
-            .filter(|(_, c)| audio_exclude::dsp::rms_db(c) > -60.0)
-            .map(|(i, c)| format!("{}ms:{:.0}", i * 10, audio_exclude::dsp::rms_db(c)))
+            .filter(|(_, c)| ausieve::dsp::rms_db(c) > -60.0)
+            .map(|(i, c)| format!("{}ms:{:.0}", i * 10, ausieve::dsp::rms_db(c)))
             .take(12)
             .collect();
         println!(
             "[diag ding {round}] silence before: {pre_nonzero} non-zero samples (max {pre_max:e}) | raw peak {:.4} ({:.1} dBFS), clipped {} | cable peak {:.4}, clipped {} | lag {:.2} ms (cable after raw {:.1} ms), corr {corr:.5}, gain {gain:.4} | signal {sig_rms:.1} dB, residual {res_rms:.1} dB (peak {res_peak:.4}), loud residual blocks {bad:?} | recorder gaps cable {} raw {}",
             peak(&raw.samples),
-            audio_exclude::dsp::to_db(peak(&raw.samples)),
+            ausieve::dsp::to_db(peak(&raw.samples)),
             clipped(&raw.samples),
             peak(&cable_al),
             clipped(&cable_al),
@@ -1152,19 +1152,19 @@ fn t12_silence_dither() {
         let blocks: Vec<&[f32]> = s.chunks_exact(RATE as usize / 100).collect();
         let zero_samples = s.iter().filter(|v| **v == 0.0).count();
         let all_zero_blocks = blocks.iter().filter(|b| b.iter().all(|v| *v == 0.0)).count();
-        let rms = audio_exclude::dsp::rms_db(s);
+        let rms = ausieve::dsp::rms_db(s);
         let peak = s.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         println!(
             "[t12 dither {}] {} samples: {zero_samples} exact zeros, {all_zero_blocks}/{} all-zero 10 ms blocks, rms {rms:.1} dBFS, peak {:.1} dBFS",
             if dither { "on" } else { "off" },
             s.len(),
             blocks.len(),
-            audio_exclude::dsp::to_db(peak)
+            ausieve::dsp::to_db(peak)
         );
         if dither {
             assert_eq!(all_zero_blocks, 0, "no 10 ms block may be all zeros");
             assert_eq!(zero_samples, 0, "no sample may be an exact zero");
-            assert!(rms < -80.0 && audio_exclude::dsp::to_db(peak) < -80.0, "dither must be inaudible: rms {rms:.1}, peak {peak}");
+            assert!(rms < -80.0 && ausieve::dsp::to_db(peak) < -80.0, "dither must be inaudible: rms {rms:.1}, peak {peak}");
             // and real audio still passes without glitches
             let cable = record(Source::Cable, 2500);
             let raw = record(Source::ProcessLoopback(dummy.pid()), 2500);
@@ -1182,14 +1182,14 @@ fn t12_silence_dither() {
     }
 }
 
-/// Diagnostic (ignored): a continuous 1000 Hz tone for `AUDIO_EXCLUDE_LONG_MS` (default
+/// Diagnostic (ignored): a continuous 1000 Hz tone for `AUSIEVE_LONG_MS` (default
 /// 20000) ms through capture; counts cable glitches the raw loopback doesn't explain.
-/// Run with AUDIO_EXCLUDE_STATS=1 to see capture's per-second underruns.
+/// Run with AUSIEVE_STATS=1 to see capture's per-second underruns.
 #[test]
 #[ignore]
 fn diag_long_run() {
     let _g = serial();
-    let ms: u64 = std::env::var("AUDIO_EXCLUDE_LONG_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(20000);
+    let ms: u64 = std::env::var("AUSIEVE_LONG_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(20000);
     let dummy = start_dummy();
     let pid = dummy.pid().to_string();
     let _cap = start_capture(&["--exclude-pid", &pid]);
@@ -1198,9 +1198,9 @@ fn diag_long_run() {
     thread::sleep(Duration::from_millis(500));
     let cable = record(Source::Cable, ms);
     let raw = record(Source::ProcessLoopback(dummy.pid()), ms);
-    // AUDIO_EXCLUDE_INJECT=1: every 1.5 s another process opens a (silent) stream for 0.5 s
+    // AUSIEVE_INJECT=1: every 1.5 s another process opens a (silent) stream for 0.5 s
     let mut opened = Vec::new();
-    if std::env::var_os("AUDIO_EXCLUDE_INJECT").is_some() {
+    if std::env::var_os("AUSIEVE_INJECT").is_some() {
         let t0 = Instant::now();
         while t0.elapsed() < Duration::from_millis(ms.saturating_sub(1500)) {
             thread::sleep(Duration::from_millis(1000));
@@ -1367,14 +1367,14 @@ fn rapid_streams(n: usize, every_ms: u64, beep: bool) -> Vec<f64> {
 }
 
 /// Diagnostic (ignored): a continuous 1000 Hz sine plays; another stream is opened and
-/// closed 20 times in a row (`AUDIO_EXCLUDE_EVERY_MS`, default 150). Raw process
+/// closed 20 times in a row (`AUSIEVE_EVERY_MS`, default 150). Raw process
 /// loopback and device loopback of the tone device are recorded at the same time; for
 /// each: timestamp gaps (lost audio), DATA_DISCONTINUITY flags, and waveform jumps.
 #[test]
 #[ignore]
 fn diag_rapid_streams() {
     let _g = serial();
-    let every: u64 = std::env::var("AUDIO_EXCLUDE_EVERY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(150);
+    let every: u64 = std::env::var("AUSIEVE_EVERY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(150);
     let dummy = start_dummy();
     let _t = start_tone(&tone_exe(), F_EXCLUDED, &["--duration", "12000"]);
     thread::sleep(Duration::from_millis(500));
@@ -1382,7 +1382,7 @@ fn diag_rapid_streams() {
     let raw = record_packets(Source::ProcessLoopback(dummy.pid()), ms);
     let dev = record_packets(Source::Local, ms);
     thread::sleep(Duration::from_millis(700));
-    let opened = rapid_streams(20, every, std::env::var_os("AUDIO_EXCLUDE_BEEP").is_some());
+    let opened = rapid_streams(20, every, std::env::var_os("AUSIEVE_BEEP").is_some());
     let (raw, dev) = (raw.join().unwrap(), dev.join().unwrap());
     println!("[diag rapid] streams opened every {every} ms at qpc {:.0}..{:.0} ms", opened[0], opened[opened.len() - 1]);
     for (name, r) in [("process loopback", &raw), ("device loopback", &dev)] {
@@ -1405,14 +1405,14 @@ fn diag_rapid_streams() {
    gaps at {:?}", &ev[..ev.len().min(12)].iter().map(|t| t + 100.0).collect::<Vec<_>>(), &pos[..pos.len().min(6)]);
     }
     // the raw packets through the timeline logic (offline), like the engine does
-    let mut tl = audio_exclude::timeline::Timeline::new(SAMPLE_RATE);
+    let mut tl = ausieve::timeline::Timeline::new(SAMPLE_RATE);
     let mut out: Vec<f32> = Vec::new();
     let mut i = 0;
     for &(q, n, _) in &raw.log {
         let pkt: Vec<f32> = raw.samples[i..i + n].iter().flat_map(|v| [*v; CHANNELS]).collect();
         let (hole, s) = tl.packet(&pkt, q);
         let mut tail: Vec<f32> = out[out.len().saturating_sub(hole.fade_out)..].iter().flat_map(|v| [*v; CHANNELS]).collect();
-        audio_exclude::timeline::fade_out_tail(&mut tail, hole.fade_out);
+        ausieve::timeline::fade_out_tail(&mut tail, hole.fade_out);
         let at = out.len() - tail.len() / CHANNELS;
         out.truncate(at);
         out.extend(tail.chunks(CHANNELS).map(|f| f[0]));
@@ -1509,7 +1509,7 @@ fn t13_rapid_stream_open_close() {
 {report}", ev.len());
 }
 
-/// Diagnostic (ignored): the real thing. A ding (`AUDIO_EXCLUDE_DING`, default
+/// Diagnostic (ignored): the real thing. A ding (`AUSIEVE_DING`, default
 /// Windows Background.wav) restarted 15 times every 150 ms (`SoundPlayer.Play()`, like
 /// rapid clicks on the volume slider), through capture.
 /// The cable is compared with device loopback (what "System sound" sends). Counts 5 ms
@@ -1518,7 +1518,7 @@ fn t13_rapid_stream_open_close() {
 #[ignore]
 fn diag_rapid_dings() {
     let _g = serial();
-    let wav = std::env::var("AUDIO_EXCLUDE_DING").unwrap_or_else(|_| r"C:\Windows\Media\Windows Background.wav".into());
+    let wav = std::env::var("AUSIEVE_DING").unwrap_or_else(|_| r"C:\Windows\Media\Windows Background.wav".into());
     let dummy = start_dummy();
     let pid = dummy.pid().to_string();
     for (label, env) in [("capture", &[][..])] {
@@ -1547,7 +1547,7 @@ fn diag_rapid_dings() {
         let blk = 240;
         let mut dropouts = Vec::new();
         for (k, (r, c)) in reference[..m].chunks(blk).zip(delayed[lag..lag + m].chunks(blk)).enumerate() {
-            let (lr, lc) = (audio_exclude::dsp::rms_db(r), audio_exclude::dsp::rms_db(c) - audio_exclude::dsp::to_db(gain));
+            let (lr, lc) = (ausieve::dsp::rms_db(r), ausieve::dsp::rms_db(c) - ausieve::dsp::to_db(gain));
             if lr > -40.0 && lc < lr - 12.0 {
                 dropouts.push(k * 5);
             }
@@ -1556,8 +1556,8 @@ fn diag_rapid_dings() {
         println!(
             "[diag rapid dings {label}] lag {:.2} ms, corr {corr:.4}, gain {gain:.3} | signal {:.1} dB, residual {:.1} dB | dropout blocks (5 ms): {} at {:?} | recorder gaps cable {} local {}",
             lag as f32 * 1000.0 / RATE,
-            audio_exclude::dsp::rms_db(&reference[..m]),
-            audio_exclude::dsp::rms_db(&res),
+            ausieve::dsp::rms_db(&reference[..m]),
+            ausieve::dsp::rms_db(&res),
             dropouts.len(),
             &dropouts[..dropouts.len().min(12)],
             cable.gaps,
@@ -1601,7 +1601,7 @@ impl PacketRec {
     }
 }
 
-/// Diagnostic (ignored): ONE ding (`AUDIO_EXCLUDE_DING`, default Windows
+/// Diagnostic (ignored): ONE ding (`AUSIEVE_DING`, default Windows
 /// Background.wav), (a) after silence and (b) while a continuous 1000 Hz sine plays.
 /// Locates, on the QPC timeline relative to the ding's start/end in device loopback,
 /// where process loopback has timestamp holes and runs of zeros. Then compares the
@@ -1610,11 +1610,11 @@ impl PacketRec {
 #[ignore]
 fn diag_single_ding() {
     let _g = serial();
-    let wav = std::env::var("AUDIO_EXCLUDE_DING").unwrap_or_else(|_| r"C:\Windows\Media\Windows Background.wav".into());
+    let wav = std::env::var("AUSIEVE_DING").unwrap_or_else(|_| r"C:\Windows\Media\Windows Background.wav".into());
     let dummy = start_dummy();
     let pid = dummy.pid().to_string();
-    // AUDIO_EXCLUDE_CASE=sine: only the case over a sine
-    let only_sine = std::env::var("AUDIO_EXCLUDE_CASE").is_ok_and(|v| v == "sine");
+    // AUSIEVE_CASE=sine: only the case over a sine
+    let only_sine = std::env::var("AUSIEVE_CASE").is_ok_and(|v| v == "sine");
     for with_sine in [false, true] {
         if only_sine && !with_sine {
             continue;
@@ -1682,14 +1682,14 @@ fn diag_single_ding() {
             let blk = 240;
             let mut dropouts = Vec::new();
             for (k, (r, cc)) in reference.chunks(blk).zip(cab[lag..lag + n].chunks(blk)).enumerate() {
-                let (lr, lc) = (audio_exclude::dsp::rms_db(r), audio_exclude::dsp::rms_db(cc) - audio_exclude::dsp::to_db(gain));
+                let (lr, lc) = (ausieve::dsp::rms_db(r), ausieve::dsp::rms_db(cc) - ausieve::dsp::to_db(gain));
                 if lr > -45.0 && lc < lr - 10.0 {
                     dropouts.push(rel(dev.qpc_ms_at(start + k * blk)));
                 }
             }
             let res: Vec<f32> = (0..n).map(|i| cab[i + lag] - gain * reference[i]).collect();
             let worst: Vec<String> = res.chunks(blk).enumerate()
-                .map(|(k, b)| (audio_exclude::dsp::rms_db(b) - audio_exclude::dsp::rms_db(&reference[k * blk..(k * blk + blk).min(n)]), k))
+                .map(|(k, b)| (ausieve::dsp::rms_db(b) - ausieve::dsp::rms_db(&reference[k * blk..(k * blk + blk).min(n)]), k))
                 .filter(|(d, _)| *d > -10.0)
                 .take(10)
                 .map(|(d, k)| format!("{}:{d:+.0}dB", rel(dev.qpc_ms_at(start + k * blk))))
@@ -1697,7 +1697,7 @@ fn diag_single_ding() {
             println!(
                 "    cable vs device loopback: lag {:.2} ms, corr {corr:.4}, gain {gain:.3}, residual {:.1} dB rel. signal | 5 ms dropout blocks {} {dropouts:?} | cable recorder holes {:?} | blocks with residual > -10 dB rel. {worst:?}",
                 lag as f32 * 1000.0 / RATE,
-                audio_exclude::dsp::rms_db(&res) - audio_exclude::dsp::rms_db(reference),
+                ausieve::dsp::rms_db(&res) - ausieve::dsp::rms_db(reference),
                 dropouts.len(),
                 cable.timestamp_gaps().iter().map(|g| (rel(g.1), (g.2 * 10.0).round() / 10.0)).collect::<Vec<_>>()
             );

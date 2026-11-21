@@ -1,18 +1,20 @@
 //! System-tray front end: pick which program's sound to exclude, switch between added
 //! programs, pick the output device. Settings persist in
-//! `%APPDATA%\audio-exclude\config.json`; capture resumes automatically on start.
+//! `%APPDATA%\Ausieve\config.json`; capture resumes automatically on start.
 
 #![windows_subsystem = "windows"]
+// The binary is named Ausieve so Task Manager shows Ausieve.exe.
+#![allow(non_snake_case)]
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use audio_exclude::config::Config;
-use audio_exclude::engine::{Engine, Event, Target};
-use audio_exclude::procs::{self, file_name, normalize_path};
-use audio_exclude::wasapi;
+use ausieve::config::Config;
+use ausieve::engine::{Engine, Event, Target};
+use ausieve::procs::{self, file_name, normalize_path};
+use ausieve::wasapi;
 use windows::core::{w, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Media::Audio::eRender;
@@ -140,7 +142,7 @@ impl App {
         let bad = matches!(self.status.output, Some(Err(_))) || self.status.capture_error.is_some();
         nid.hIcon = if bad { self.icon_warn } else { self.icon_ok };
         let (a, b) = self.status_lines();
-        fill(&mut nid.szTip, &format!("audio-exclude\n{a}\n{b}"));
+        fill(&mut nid.szTip, &format!("Ausieve\n{a}\n{b}"));
         unsafe {
             let _ = Shell_NotifyIconW(if add { NIM_ADD } else { NIM_MODIFY }, &nid);
         }
@@ -424,21 +426,28 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
 
 fn message_box(text: &str) {
     unsafe {
-        MessageBoxW(None, &HSTRING::from(text), w!("audio-exclude"), MB_OK | MB_ICONWARNING);
+        MessageBoxW(None, &HSTRING::from(text), w!("Ausieve"), MB_OK | MB_ICONWARNING);
     }
 }
 
 fn main() {
     unsafe {
         // One instance only: two would fight over the exclusive output device.
-        let _mutex = CreateMutexW(None, true, w!("Local\\audio-exclude-tray"));
+        let _mutex = CreateMutexW(None, true, w!("Local\\ausieve-tray"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            message_box("audio-exclude 已经在运行（见系统托盘）。");
+            message_box("Ausieve 已经在运行（见系统托盘）。");
             return;
         }
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
-        let cfg_path = std::env::var_os("AUDIO_EXCLUDE_CONFIG").map(PathBuf::from).unwrap_or_else(Config::default_path);
+        let cfg_path = match std::env::var_os("AUSIEVE_CONFIG") {
+            Some(p) => PathBuf::from(p),
+            None => {
+                let p = Config::default_path();
+                Config::migrate_legacy(&p);
+                p
+            }
+        };
         let (cfg, load_err) = match Config::load(&cfg_path) {
             Ok(c) => (c, None),
             Err(e) => {
@@ -450,13 +459,13 @@ fn main() {
         };
 
         let hinst = GetModuleHandleW(None).unwrap_or_default();
-        let class = w!("audio-exclude-tray");
+        let class = w!("ausieve-tray");
         let wc = WNDCLASSW { lpfnWndProc: Some(wndproc), hInstance: hinst.into(), lpszClassName: class, ..Default::default() };
         RegisterClassW(&wc);
         let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class,
-            w!("audio-exclude"),
+            w!("Ausieve"),
             WINDOW_STYLE(0),
             0,
             0,

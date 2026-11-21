@@ -254,9 +254,9 @@ fn stream<F: FnMut(Event)>(st: &mut State<F>, rx: &Receiver<Cmd>, out: &Output) 
     (st.emit)(Event::Target(pid));
     (st.emit)(Event::Running);
 
-    let mut stats = Stats::new(rate, std::env::var_os("AUDIO_EXCLUDE_STATS").is_some());
-    // AUDIO_EXCLUDE_NO_TIMELINE: join packets end to end as before (for A/B comparisons)
-    let timeline_on = std::env::var_os("AUDIO_EXCLUDE_NO_TIMELINE").is_none();
+    let mut stats = Stats::new(rate, std::env::var_os("AUSIEVE_STATS").is_some());
+    // AUSIEVE_NO_TIMELINE: join packets end to end as before (for A/B comparisons)
+    let timeline_on = std::env::var_os("AUSIEVE_NO_TIMELINE").is_none();
     let mut timeline = Timeline::new(rate);
     let mut last_resolve = Instant::now();
     loop {
@@ -330,7 +330,7 @@ fn stream<F: FnMut(Event)>(st: &mut State<F>, rx: &Receiver<Cmd>, out: &Output) 
     }
 }
 
-/// Optional per-second diagnostics on stderr (`AUDIO_EXCLUDE_STATS=1`).
+/// Optional per-second diagnostics on stderr (`AUSIEVE_STATS=1`).
 struct Stats {
     on: bool,
     rate: u32,

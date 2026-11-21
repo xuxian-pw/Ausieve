@@ -1,4 +1,4 @@
-//! Persistent settings of the tray app (`%APPDATA%\audio-exclude\config.json`).
+//! Persistent settings of the tray app (`%APPDATA%\Ausieve\config.json`).
 
 use std::path::{Path, PathBuf};
 
@@ -40,10 +40,24 @@ impl Config {
         self.buffer_ms.unwrap_or(crate::engine::DEFAULT_BUFFER_MS)
     }
 
-    /// `%APPDATA%\audio-exclude\config.json`
+    /// `%APPDATA%\Ausieve\config.json`
     pub fn default_path() -> PathBuf {
         let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-        base.join("audio-exclude").join("config.json")
+        base.join("Ausieve").join("config.json")
+    }
+
+    /// Before the rename the settings lived in `%APPDATA%\audio-exclude\config.json`;
+    /// copies that file to `path` once if `path` does not exist yet.
+    pub fn migrate_legacy(path: &Path) {
+        let Some(base) = std::env::var_os("APPDATA").map(PathBuf::from) else { return };
+        let old = base.join("audio-exclude").join("config.json");
+        if path.exists() || !old.exists() {
+            return;
+        }
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::copy(&old, path);
     }
 
     /// Loads the config; a missing file gives the defaults.
@@ -120,7 +134,7 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("audio-exclude-test-{}-{name}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("ausieve-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d.join("sub").join("config.json")
     }

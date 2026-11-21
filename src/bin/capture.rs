@@ -13,8 +13,8 @@
 
 use std::process::ExitCode;
 
-use audio_exclude::engine::{Engine, Event, Target, DEFAULT_BUFFER_MS};
-use audio_exclude::wasapi;
+use ausieve::engine::{Engine, Event, Target, DEFAULT_BUFFER_MS};
+use ausieve::wasapi;
 use windows::Win32::Media::Audio::{eCapture, eRender};
 
 const DEFAULT_OUTPUT: &str = "Line 1 (Virtual Audio Cable)";

@@ -1,4 +1,4 @@
-# audio-exclude
+# Ausieve
 
 把 Windows 上**除某个程序以外**的所有声音实时转进虚拟声卡。
 
@@ -7,7 +7,7 @@
 典型用途：远控被控端同时开着 Discord 等语音软件时，RustDesk 采集系统声音会把对方的语音也传回去，造成回音。用本工具排除语音软件，再让 RustDesk 采集虚拟声卡，就没有回音了。效果类似 Parsec 的“排除应用程序”。
 
 ```
-系统里所有程序的声音 ──(排除 Discord)──▶ audio-exclude ──▶ 虚拟声卡播放端 ──▶ 虚拟声卡录音端 ──▶ RustDesk
+系统里所有程序的声音 ──(排除 Discord)──▶ Ausieve ──▶ 虚拟声卡播放端 ──▶ 虚拟声卡录音端 ──▶ RustDesk
 ```
 
 ## 准备
@@ -17,11 +17,11 @@
 
 ## 安装
 
-从 [Releases](https://github.com/xuxian-pw/Ausk/releases) 下载 `audio-exclude-setup-<版本>.exe` 运行。默认装到当前用户，不需要管理员权限，可以勾选开机自启动。
+从 [Releases](https://github.com/xuxian-pw/Ausieve/releases) 下载 `Ausieve-setup-<版本>.exe` 运行。默认装到当前用户，不需要管理员权限，需要开机自启动的话，把它的快捷方式放进启动文件夹（Win+R 输入 `shell:startup`）。
 
 ## 快速上手
 
-1. 运行 audio-exclude，系统托盘里会出现它的图标。
+1. 运行 Ausieve，系统托盘里会出现它的图标。
 2. 单击图标 → **添加程序…** → 选中要排除的程序的 exe（例如 `Discord.exe`）。
 3. 单击图标 → **输出设备** → 选虚拟声卡的**播放端**（默认已经是 `Line 1`）。
 4. 在被控端的 RustDesk 设置里，把 **音频输入（Audio input）** 设为虚拟声卡的**录音端**，例如 `Line 1 (Virtual Audio Cable)` 或 `CABLE Output (VB-Audio Virtual Cable)`。
@@ -48,7 +48,7 @@
 
 ## 设置
 
-设置保存在 `%APPDATA%\audio-exclude\config.json`，启动时自动恢复并开始采集，卸载时保留。文件损坏时会改名为 `config.json.bad`，然后用默认设置启动。环境变量 `AUDIO_EXCLUDE_CONFIG` 可以指定别的路径。
+设置保存在 `%APPDATA%\Ausieve\config.json`，启动时自动恢复并开始采集，卸载时保留。文件损坏时会改名为 `config.json.bad`，然后用默认设置启动。环境变量 `AUSIEVE_CONFIG` 可以指定别的路径。
 
 下面两项不在菜单里，需要时手动写进配置文件再重启程序：
 
@@ -94,9 +94,9 @@ capture.exe --exclude-name Discord.exe --output "Line 1 (Virtual Audio Cable)"
 cargo build --release
 ```
 
-生成 `target\release\` 下的 `tray.exe`（托盘程序）、`capture.exe`（命令行版本）和 `tone.exe`（测试辅助程序）。
+生成 `target\release\` 下的 `Ausieve.exe`（托盘程序）、`capture.exe`（命令行版本）和 `tone.exe`（测试辅助程序）。
 
-打包安装程序需要 [Inno Setup 6](https://jrsoftware.org/isinfo.php)。下面的脚本会重新构建（去掉 exe 里的本机路径），再生成 `target\installer\audio-exclude-setup-<版本>.exe`，版本号取自 `Cargo.toml`：
+打包安装程序需要 [Inno Setup 6](https://jrsoftware.org/isinfo.php)。下面的脚本会重新构建（去掉 exe 里的本机路径），再生成 `target\installer\Ausieve-setup-<版本>.exe`，版本号取自 `Cargo.toml`：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File installer\build.ps1

@@ -1,5 +1,5 @@
 [package]
-name = "audio-exclude"
+name = "ausieve"
 version = "0.1.0"
 edition = "2021"
 description = "Capture all system audio except one process tree (WASAPI process loopback) and play it into a virtual audio cable."

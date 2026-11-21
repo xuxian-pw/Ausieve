@@ -1,4 +1,4 @@
-# audio-exclude
+# Ausieve
 
 Windows 工具：用 WASAPI process loopback 采集“除某个程序外”的全部系统声音，写进虚拟声卡（默认 `Line 1 (Virtual Audio Cable)`），被控端的 RustDesk 把 Audio input 设成这条线的录音端。用法和参数在 `README.md`，测试用例的断言和测试用的环境变量在 `docs/testing.md`，延迟构成和各次杂音修复的实测在 `docs/design.md`，这里只记录看代码看不出来的东西。
 
@@ -9,7 +9,7 @@ Windows 工具：用 WASAPI process loopback 采集“除某个程序外”的�
 
 ## 跑测试
 
-- 测试使用真实设备，会从默认输出播放测试音，并独占 Line 1。`tray.exe` 在运行时，测试打不开 Line 1，`cargo build --release` 也写不进 exe。遇到这种情况，请使用者从托盘菜单点“退出”，不要直接结束这个进程。
+- 测试使用真实设备，会从默认输出播放测试音，并独占 Line 1。`Ausieve.exe` 在运行时，测试打不开 Line 1，`cargo build --release` 也写不进 exe。遇到这种情况，请使用者从托盘菜单点“退出”，不要直接结束这个进程。
 - 测试强度适中：针对性的诊断跑一两次，完整测试跑一两次确认就够，不要连续跑十几轮做统计。
 - 有的安全软件（例如 ESET）在新进程打开录音设备时会播放约 2.5 秒的提示音，这段声音会被采进 Line 1。测试在开始测量前会先等系统安静下来；分析没解释清楚的杂音时，先排除这个来源。
 - 名字是 `diag_*` 的测试默认被忽略，是一次性的排查工具，需要时用 `--ignored` 单独运行。

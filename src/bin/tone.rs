@@ -18,8 +18,8 @@ use std::f64::consts::PI;
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 
-use audio_exclude::procs::is_alive;
-use audio_exclude::wasapi::{self, CHANNELS, SAMPLE_RATE};
+use ausieve::procs::is_alive;
+use ausieve::wasapi::{self, CHANNELS, SAMPLE_RATE};
 use windows::Win32::Media::Audio::eRender;
 
 struct Args {

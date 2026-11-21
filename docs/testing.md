@@ -29,7 +29,7 @@ cargo test -- --nocapture
 另有单元测试，覆盖路径规范化、根进程选择（包括 PID 被复用的情况）、配置文件的读写和修复。
 
 托盘程序的这些部分**没有自动化测试**，需要手动验证：菜单的外观和点击、文件选择框、通知气泡、悬停提示，以及 Explorer 重启后图标能否恢复。
-t8 通过发送与菜单项相同的命令 ID（`WM_COMMAND`）来驱动托盘程序；运行测试时不能有另一个 `tray.exe` 在运行。
+t8 通过发送与菜单项相同的命令 ID（`WM_COMMAND`）来驱动托盘程序；运行测试时不能有另一个 `Ausieve.exe` 在运行。
 
 参考实测值（Windows 10 19044 + VAC）：t1/t4/t5 的抑制量为 54–100dB，t6 的延迟约 37–42ms（缓冲 20ms）。
 
@@ -39,16 +39,16 @@ t10 会受到其他声音的干扰（被采集的是整个系统的声音），�
 
 | 变量 | 作用 |
 |---|---|
-| `AUDIO_EXCLUDE_CABLE` | 虚拟声卡名，默认 `Line 1 (Virtual Audio Cable)` |
-| `AUDIO_EXCLUDE_TONE_DEVICE` | 测试音使用的播放设备，默认是系统默认设备。设为另一条空闲的虚拟线后，测试就完全静音 |
-| `AUDIO_EXCLUDE_MAX_LATENCY_MS` | 延迟阈值，默认 50 |
-| `AUDIO_EXCLUDE_DUMP=1` | t3 打印 10ms 粒度的包络 |
-| `AUDIO_EXCLUDE_BUFFER_MS` | 测试中 capture 使用的缓冲 |
-| `AUDIO_EXCLUDE_CAPTURE_EXE` | 用另一个 capture.exe 跑测试（新旧版本对比） |
-| `AUDIO_EXCLUDE_STATS=1` | capture/tray 每秒向 stderr 打印诊断：采集包、抖动缓冲水位、欠载、丢弃、漂移控制的速度；另外每次晚到/丢失的包、每次补静音、每次欠载都单独打印一行，带 QPC 时间 |
-| `AUDIO_EXCLUDE_NO_TIMELINE=1` | capture/tray 关闭时间轴对齐（见 [design.md](design.md)），只用于新旧对比 |
-| `AUDIO_EXCLUDE_RAW_BUFFER_MS` | 测试自己的录音流的缓冲容量，默认与 capture 相同（5 秒） |
-| `AUDIO_EXCLUDE_T6_DELAY_MS` | t6 中脉冲在它的流打开之后多久播放，默认 500 |
+| `AUSIEVE_CABLE` | 虚拟声卡名，默认 `Line 1 (Virtual Audio Cable)` |
+| `AUSIEVE_TONE_DEVICE` | 测试音使用的播放设备，默认是系统默认设备。设为另一条空闲的虚拟线后，测试就完全静音 |
+| `AUSIEVE_MAX_LATENCY_MS` | 延迟阈值，默认 50 |
+| `AUSIEVE_DUMP=1` | t3 打印 10ms 粒度的包络 |
+| `AUSIEVE_BUFFER_MS` | 测试中 capture 使用的缓冲 |
+| `AUSIEVE_CAPTURE_EXE` | 用另一个 capture.exe 跑测试（新旧版本对比） |
+| `AUSIEVE_STATS=1` | capture/tray 每秒向 stderr 打印诊断：采集包、抖动缓冲水位、欠载、丢弃、漂移控制的速度；另外每次晚到/丢失的包、每次补静音、每次欠载都单独打印一行，带 QPC 时间 |
+| `AUSIEVE_NO_TIMELINE=1` | capture/tray 关闭时间轴对齐（见 [design.md](design.md)），只用于新旧对比 |
+| `AUSIEVE_RAW_BUFFER_MS` | 测试自己的录音流的缓冲容量，默认与 capture 相同（5 秒） |
+| `AUSIEVE_T6_DELAY_MS` | t6 中脉冲在它的流打开之后多久播放，默认 500 |
 
 注意：
 
