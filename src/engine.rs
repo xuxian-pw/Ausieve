@@ -18,6 +18,11 @@ use crate::wasapi::{self, CaptureStream};
 /// 4-15 ms per event): with 12 ms that margin is only ~2 ms and the full test suite
 /// glitched in 2 of 6 runs, with 20 ms in 0 of 6. End-to-end latency (t6): 12 ms ~29 ms,
 /// 20 ms ~36 ms.
+///
+/// Re-measured after the timeline silence filling (f1c2f76), one full suite each: the
+/// margin is still needed, now for late packets during bursts of stream opens/closes
+/// (t13). t13 cable glitches / t6 median: 12 ms 15 / 31 ms (t11, t12 fail too),
+/// 15 ms 4 / 32 ms, 17 ms 2 / 39 ms, 20 ms 0 / 41 ms.
 pub const DEFAULT_BUFFER_MS: u32 = 20;
 /// Highest accepted value.
 pub const MAX_BUFFER_MS: u32 = 200;
