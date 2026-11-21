@@ -80,11 +80,13 @@ capture.exe --exclude-name Discord.exe --output "Line 1 (Virtual Audio Cable)"
 
 ## 诊断
 
-不能用的时候，在安装目录（默认 `%LOCALAPPDATA%\Programs\Ausieve`）里运行：
+不能用的时候，下载仓库里的 [scripts/diagnose.ps1](scripts/diagnose.ps1)（安装包里不带），在它所在的文件夹里运行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File diagnose.ps1
 ```
+
+脚本会在默认安装目录（`%LOCALAPPDATA%\Programs\Ausieve` 或 `%ProgramFiles%\Ausieve`）里找 `capture.exe`。
 
 几秒后会在桌面生成 `Ausieve-diagnose-<时间>.txt`，提交问题时附上这个文件即可。里面有系统版本、音频设备和驱动、配置文件、一次 5 秒的 `capture.exe` 试运行结果，以及 RustDesk 的 Audio input 设置。
 
