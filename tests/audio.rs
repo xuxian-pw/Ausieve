@@ -1541,3 +1541,145 @@ fn diag_rapid_dings() {
         );
     }
 }
+
+impl PacketRec {
+    /// QPC time (ms) of sample `idx` (from the packet containing it).
+    fn qpc_ms_at(&self, idx: usize) -> f64 {
+        let mut pos = 0usize;
+        for &(q, n, _) in &self.log {
+            if idx < pos + n {
+                return q as f64 / 1e4 + (idx - pos) as f64 * 1000.0 / RATE as f64;
+            }
+            pos += n;
+        }
+        self.log.last().map(|l| l.0 as f64 / 1e4).unwrap_or(0.0)
+    }
+
+    /// Runs of exact zeros (at least 1 ms) that start right after non-zero audio:
+    /// (qpc ms of the first zero, length ms).
+    fn zero_runs(&self) -> Vec<(f64, f64)> {
+        let mut out = Vec::new();
+        let mut i = 1;
+        let x = &self.samples;
+        while i < x.len() {
+            if x[i] == 0.0 && x[i - 1] != 0.0 {
+                let s = i;
+                while i < x.len() && x[i] == 0.0 {
+                    i += 1;
+                }
+                if i - s >= RATE as usize / 1000 && i < x.len() {
+                    out.push((self.qpc_ms_at(s), (i - s) as f64 * 1000.0 / RATE as f64));
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+}
+
+/// Diagnostic (ignored): ONE ding (`AUDIO_EXCLUDE_DING`, default Windows
+/// Background.wav), (a) after silence and (b) while a continuous 1000 Hz sine plays.
+/// Locates, on the QPC timeline relative to the ding's start/end in device loopback,
+/// where process loopback has timestamp holes and runs of zeros. Then compares the
+/// cable (through capture, with and without concealment) with device loopback.
+#[test]
+#[ignore]
+fn diag_single_ding() {
+    let _g = serial();
+    let wav = std::env::var("AUDIO_EXCLUDE_DING").unwrap_or_else(|_| r"C:\Windows\Media\Windows Background.wav".into());
+    let dummy = start_dummy();
+    let pid = dummy.pid().to_string();
+    // AUDIO_EXCLUDE_CASE=sine: only the case over a sine, without concealment
+    let only_sine = std::env::var("AUDIO_EXCLUDE_CASE").is_ok_and(|v| v == "sine");
+    for with_sine in [false, true] {
+        if only_sine && !with_sine {
+            continue;
+        }
+        for (label, env) in [("no concealment", &[("AUDIO_EXCLUDE_NO_CONCEAL", "1")][..]), ("concealment", &[][..])] {
+            if only_sine && env.is_empty() {
+                continue;
+            }
+            let case = format!("{} / {label}", if with_sine { "over a sine" } else { "after silence" });
+            let _t = with_sine.then(|| start_tone(&tone_exe(), F_EXCLUDED, &["--duration", "9000"]));
+            let _cap = start_capture_env(&["--exclude-pid", &pid], env);
+            thread::sleep(Duration::from_millis(if with_sine { 1500 } else { 4000 }));
+            let raw = record_packets(Source::ProcessLoopback(dummy.pid()), 4000);
+            let dev = record_packets(Source::Local, 4000);
+            let cable = record_packets(Source::Cable, 4000);
+            thread::sleep(Duration::from_millis(500));
+            let mut ps = Command::new("powershell");
+            ps.args(["-NoProfile", "-Command", &format!("$p = New-Object Media.SoundPlayer '{wav}'; $p.Load(); $q0 = [Diagnostics.Stopwatch]::GetTimestamp(); $p.PlaySync(); $q1 = [Diagnostics.Stopwatch]::GetTimestamp(); Write-Output \"$q0 $q1 $([Diagnostics.Stopwatch]::Frequency)\"")]);
+            let o = ps.output().unwrap();
+            let v: Vec<f64> = String::from_utf8_lossy(&o.stdout).split_whitespace().filter_map(|s| s.parse().ok()).collect();
+            let (raw, dev, cable) = (raw.join().unwrap(), dev.join().unwrap(), cable.join().unwrap());
+            // ding activity in device loopback: where the signal departs from the sine
+            // (or from silence)
+            let c = 2.0 * (2.0 * std::f32::consts::PI * F_EXCLUDED / RATE).cos();
+            let active: Vec<usize> = (2..dev.samples.len())
+                .filter(|&n| {
+                    let x = &dev.samples;
+                    if with_sine { (x[n] - c * x[n - 1] + x[n - 2]).abs() > 0.003 } else { x[n].abs() > 0.0005 }
+                })
+                .collect();
+            let (Some(&a0), Some(&a1)) = (active.first(), active.last()) else {
+                // locate the process-loopback holes relative to PlaySync's call/return
+                if v.len() == 3 {
+                    let (c0, c1) = (v[0] / v[2] * 1000.0, v[1] / v[2] * 1000.0);
+                    let holes: Vec<String> = raw.timestamp_gaps().iter().map(|g| format!("call{:+.1} / return{:+.1} ({:.1} ms)", g.1 - c0, g.1 - c1, g.2)).collect();
+                    let zeros: Vec<String> = raw.zero_runs().iter().filter(|z| z.1 < 200.0).map(|z| format!("call{:+.1} ({:.1} ms)", z.0 - c0, z.1)).collect();
+                    println!("[diag single ding {case}] ding not found in device loopback; PlaySync took {:.0} ms; process loopback holes {holes:?}; zero runs {zeros:?}; device loopback holes {}", c1 - c0, dev.timestamp_gaps().len());
+                }
+                continue;
+            };
+            let (on, off) = (dev.qpc_ms_at(a0), dev.qpc_ms_at(a1));
+            let rel = |q: f64| {
+                if q < on + (off - on) / 2.0 { format!("onset{:+.1}", q - on) } else { format!("end{:+.1}", q - off) }
+            };
+            let holes: Vec<String> = raw.timestamp_gaps().iter().map(|g| format!("{} ({:.1} ms)", rel(g.1), g.2)).collect();
+            let zeros: Vec<String> = raw.zero_runs().iter().filter(|z| z.1 < 200.0).map(|z| format!("{} ({:.1} ms)", rel(z.0), z.1)).collect();
+            let first_raw = raw.log.first().map(|l| rel(l.0 as f64 / 1e4)).unwrap_or_default();
+            let ps_times = if v.len() == 3 { format!("PlaySync called at {}, returned at {}", rel(v[0] / v[2] * 1000.0), rel(v[1] / v[2] * 1000.0)) } else { String::new() };
+            println!("[diag single ding {case}] ding in device loopback {on:.1}..{off:.1} ms qpc ({:.0} ms long); {ps_times}; device loopback holes {}", off - on, dev.timestamp_gaps().len());
+            println!("    process loopback: first packet {first_raw}; holes {holes:?}; zero runs after audio {zeros:?}");
+            // cable vs device loopback: align by cross-correlation around the ding
+            let ci = cable.samples.iter().position(|_| true).unwrap_or(0);
+            let _ = ci;
+            let cq0 = cable.log.first().map(|l| l.0 as f64 / 1e4).unwrap_or(0.0);
+            let dq0 = dev.log.first().map(|l| l.0 as f64 / 1e4).unwrap_or(0.0);
+            // place both on dev's sample timeline (contiguous; neither recorder had holes)
+            let off_s = ((cq0 - dq0) * RATE as f64 / 1000.0).round() as i64;
+            let start = a0.saturating_sub(2400);
+            let n = (a1 + 2400).min(dev.samples.len()) - start;
+            let reference = &dev.samples[start..start + n];
+            let cab: Vec<f32> = (0..n + 9600).map(|i| {
+                let j = (start + i) as i64 - off_s;
+                if j >= 0 && (j as usize) < cable.samples.len() { cable.samples[j as usize] } else { 0.0 }
+            }).collect();
+            let (lag, corr) = xcorr_lag(reference, &cab, 4800);
+            let (num, den) = (0..n).fold((0.0f64, 0.0f64), |(a, b), i| (a + (cab[i + lag] * reference[i]) as f64, b + (reference[i] * reference[i]) as f64));
+            let gain = (num / den) as f32;
+            let blk = 240;
+            let mut dropouts = Vec::new();
+            for (k, (r, cc)) in reference.chunks(blk).zip(cab[lag..lag + n].chunks(blk)).enumerate() {
+                let (lr, lc) = (audio_exclude::dsp::rms_db(r), audio_exclude::dsp::rms_db(cc) - audio_exclude::dsp::to_db(gain));
+                if lr > -45.0 && lc < lr - 10.0 {
+                    dropouts.push(rel(dev.qpc_ms_at(start + k * blk)));
+                }
+            }
+            let res: Vec<f32> = (0..n).map(|i| cab[i + lag] - gain * reference[i]).collect();
+            let worst: Vec<String> = res.chunks(blk).enumerate()
+                .map(|(k, b)| (audio_exclude::dsp::rms_db(b) - audio_exclude::dsp::rms_db(&reference[k * blk..(k * blk + blk).min(n)]), k))
+                .filter(|(d, _)| *d > -10.0)
+                .take(10)
+                .map(|(d, k)| format!("{}:{d:+.0}dB", rel(dev.qpc_ms_at(start + k * blk))))
+                .collect();
+            println!(
+                "    cable vs device loopback: lag {:.2} ms, corr {corr:.4}, gain {gain:.3}, residual {:.1} dB rel. signal | 5 ms dropout blocks {} {dropouts:?} | blocks with residual > -10 dB rel. {worst:?}",
+                lag as f32 * 1000.0 / RATE,
+                audio_exclude::dsp::rms_db(&res) - audio_exclude::dsp::rms_db(reference),
+                dropouts.len()
+            );
+            thread::sleep(Duration::from_millis(300));
+        }
+    }
+}
