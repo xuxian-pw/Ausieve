@@ -52,21 +52,66 @@ pub fn add_dither(buf: &mut [f32], rng: &mut u32) {
     }
 }
 
+/// Largest playback-rate correction of the drift control (0.5 %, about 9 cents; only
+/// reached for large deficits, i.e. right after a big audio loss: recovers 10 ms of
+/// buffer in about 2-3 s).
+const MAX_CORRECTION: f64 = 0.005;
+/// Correction per ms of level error (1 ms off target -> 0.05 % faster/slower, so the
+/// usual small deviations are corrected very gently).
+const CORRECTION_PER_MS: f64 = 0.0005;
+/// Within this distance from the target level no correction is applied (and playback
+/// returns to exact 1:1 sample pass-through).
+const DEADBAND_MS: f64 = 0.5;
+/// Correction resumes only beyond this level error (hysteresis against toggling).
+const UNLOCK_MS: f64 = 1.0;
+/// Integral gain (per ms of error and second), and the error range it integrates in.
+const CORRECTION_PER_MS_S: f64 = 0.0001;
+const INTEGRATE_WITHIN_MS: f64 = 1.5;
+/// Return to 1:1 only if the clocks don't drift apart by more than this.
+const LOCK_MAX_DRIFT: f64 = 0.0002;
+/// Time constant of the level average the drift control looks at.
+const LEVEL_AVERAGE_S: f64 = 0.3;
+
 /// Interleaved-stereo FIFO between the capture thread (push) and the device (pull).
+///
+/// Process loopback delivers 10 ms packets, and loses a few ms of audio whenever any
+/// program on the system opens or closes a stream; the two device clocks also drift
+/// apart slowly. A plain FIFO cannot recover from either: each loss permanently lowers
+/// its fill level until it runs dry, which costs an audible gap. So the average fill
+/// level is steered back to its target by playing slightly (at most
+/// [`MAX_CORRECTION`]) slower or faster, with cubic interpolation. Close to the target
+/// the correction stops and samples pass through unchanged.
 #[derive(Debug)]
 pub struct Jitter {
     buf: VecDeque<f32>,
-    /// Frames to accumulate before playback (re)starts.
+    /// Frames to accumulate before playback (re)starts; the level right after a packet
+    /// arrives is kept around this.
     pub start: usize,
-    /// If more than this many frames queue up (clock drift), drop down to `start`.
+    /// If more than this many frames queue up, drop down to `start` (last resort).
     pub max: usize,
     primed: bool,
     fade_len: usize,
     fade_pos: usize,
+    rate: f64,
+    /// The frame before the queue front (interpolation history).
+    prev: [f32; CHANNELS],
+    /// Read position between the queue front (0.0) and the next frame (1.0).
+    phase: f64,
+    /// Playback-rate factor: >1 consumes faster (queue too full), <1 slower.
+    speed: f64,
+    /// 1:1 pass-through (speed exactly 1, phase exactly 0).
+    locked: bool,
+    /// Integral part of the rate correction (follows clock drift).
+    integral: f64,
+    /// Average fill level (frames), and the average packet size (frames).
+    avg_level: f64,
+    avg_packet: f64,
     pub underruns: u64,
     pub dropped_frames: u64,
     pub silent_frames: u64,
     pub pulled_frames: u64,
+    /// Output frames produced while the rate correction was active.
+    pub corrected_frames: u64,
 }
 
 impl Jitter {
@@ -78,10 +123,19 @@ impl Jitter {
             primed: false,
             fade_len: (rate * FADE_MS / 1000) as usize,
             fade_pos: 0,
+            rate: rate as f64,
+            prev: [0.0; CHANNELS],
+            phase: 0.0,
+            speed: 1.0,
+            locked: true,
+            integral: 0.0,
+            avg_level: 0.0,
+            avg_packet: rate as f64 / 100.0,
             underruns: 0,
             dropped_frames: 0,
             silent_frames: 0,
             pulled_frames: 0,
+            corrected_frames: 0,
         }
     }
 
@@ -89,7 +143,16 @@ impl Jitter {
         self.buf.len() / CHANNELS
     }
 
+    /// Current playback-rate factor (1.0 = no correction).
+    pub fn speed(&self) -> f64 {
+        self.speed
+    }
+
     pub fn push(&mut self, interleaved: &[f32]) {
+        let n_in = interleaved.len() / CHANNELS;
+        if n_in > 0 {
+            self.avg_packet += (n_in as f64 - self.avg_packet) * 0.1;
+        }
         self.buf.extend(interleaved);
         let n = self.frames();
         if n > self.max {
@@ -99,6 +162,12 @@ impl Jitter {
         }
     }
 
+    /// Target of the average level: the level oscillates between `start` (packet just
+    /// arrived) and `start - packet`, so its average is about half a packet lower.
+    fn target_level(&self) -> f64 {
+        (self.start as f64 - self.avg_packet / 2.0).max(0.0)
+    }
+
     /// Starts playback. Starts exactly at the start level: whatever arrived beyond it
     /// would only add latency (packets are 10 ms, so it could be up to 10 ms more).
     fn prime(&mut self) {
@@ -106,6 +175,94 @@ impl Jitter {
         self.fade_pos = 0;
         let extra = self.frames().saturating_sub(self.start);
         self.buf.drain(..extra * CHANNELS);
+        self.prev = [0.0; CHANNELS];
+        self.phase = 0.0;
+        self.speed = 1.0;
+        self.locked = true;
+        self.integral = 0.0;
+        self.avg_level = self.target_level();
+    }
+
+    /// Updates the level average and the playback rate (once per pull).
+    fn steer(&mut self, frames_out: usize) {
+        let dt = frames_out as f64 / self.rate;
+        let a = (dt / LEVEL_AVERAGE_S).min(1.0);
+        self.avg_level += (self.frames() as f64 - self.avg_level) * a;
+        let err_ms = (self.avg_level - self.target_level()) * 1000.0 / self.rate;
+        if self.locked {
+            if err_ms.abs() <= UNLOCK_MS {
+                return;
+            }
+            self.locked = false;
+        }
+        // Integral part: follows a constant clock drift. It only integrates near the
+        // target, so a one-off loss (a large error) doesn't wind it up.
+        if err_ms.abs() < INTEGRATE_WITHIN_MS {
+            self.integral = (self.integral + err_ms * CORRECTION_PER_MS_S * dt).clamp(-MAX_CORRECTION, MAX_CORRECTION);
+        }
+        if err_ms.abs() < DEADBAND_MS && self.integral.abs() < LOCK_MAX_DRIFT {
+            // no lasting drift: keep the last direction (slowly) until the read position
+            // reaches an exact sample, then lock (see `next_frame`)
+            self.speed = 1.0 + (self.speed - 1.0).signum() * 0.0005;
+        } else {
+            self.speed = 1.0 + (err_ms * CORRECTION_PER_MS + self.integral).clamp(-MAX_CORRECTION, MAX_CORRECTION);
+        }
+    }
+
+    fn frame(&self, i: usize, c: usize) -> Option<f32> {
+        self.buf.get(i * CHANNELS + c).copied()
+    }
+
+    fn pop_frame(&mut self) {
+        for c in 0..CHANNELS {
+            self.prev[c] = self.buf.pop_front().unwrap_or(0.0);
+        }
+    }
+
+    /// Frames needed in the queue to produce the next output frame.
+    fn needed(&self) -> usize {
+        if self.locked {
+            1
+        } else {
+            3
+        }
+    }
+
+    /// Writes the next output frame into `out` (len CHANNELS) and advances. The caller
+    /// checks `needed()` first.
+    fn next_frame(&mut self, out: &mut [f32]) {
+        if self.locked {
+            for c in 0..CHANNELS {
+                out[c] = self.buf.pop_front().unwrap_or(0.0);
+                self.prev[c] = out[c];
+            }
+            return;
+        }
+        // Catmull-Rom between prev, f0, f1, f2 at `phase` (between f0 and f1)
+        let t = self.phase as f32;
+        for c in 0..CHANNELS {
+            let p0 = self.prev[c];
+            let p1 = self.frame(0, c).unwrap_or(0.0);
+            let p2 = self.frame(1, c).unwrap_or(p1);
+            let p3 = self.frame(2, c).unwrap_or(p2);
+            out[c] = p1 + 0.5 * t * (p2 - p0 + t * (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3 + t * (3.0 * (p1 - p2) + p3 - p0)));
+        }
+        self.corrected_frames += 1;
+        self.phase += self.speed;
+        while self.phase >= 1.0 {
+            self.pop_frame();
+            self.phase -= 1.0;
+        }
+        // In the deadband the phase creeps by 0.0005 per frame: once it is within 0.001
+        // of an exact sample position, snap to it and return to 1:1 pass-through.
+        if (self.speed - 1.0).abs() <= 0.0005 + 1e-12 && (self.phase < 1e-3 || self.phase > 1.0 - 1e-3) {
+            if self.phase > 0.5 {
+                self.pop_frame();
+            }
+            self.phase = 0.0;
+            self.speed = 1.0;
+            self.locked = true;
+        }
     }
 
     /// Fills `out` (interleaved stereo) with the next frames, or silence.
@@ -118,42 +275,51 @@ impl Jitter {
     /// Returns the number of frames written to `out`.
     pub fn pull_upto(&mut self, out: &mut [f32], must_fill: bool) -> usize {
         let want = out.len() / CHANNELS;
-        if !must_fill {
-            if !self.primed {
-                if self.frames() < self.start {
+        if !self.primed {
+            if self.frames() < self.start {
+                if !must_fill {
                     return 0;
                 }
-                self.prime();
-            }
-            let n = want.min(self.frames());
-            self.pull_upto(&mut out[..n * CHANNELS], true);
-            return n;
-        }
-        self.pulled_frames += want as u64;
-        if !self.primed {
-            if self.frames() >= self.start {
-                self.prime();
-            } else {
+                self.pulled_frames += want as u64;
                 out.fill(0.0);
                 self.silent_frames += want as u64;
                 return want;
             }
+            self.prime();
         }
-        let take = want.min(self.frames());
-        for f in 0..take {
+        let mut n = 0;
+        while n < want && self.frames() >= self.needed() {
             let g = if self.fade_pos < self.fade_len {
                 self.fade_pos += 1;
                 self.fade_pos as f32 / self.fade_len as f32
             } else {
                 1.0
             };
-            for c in 0..CHANNELS {
-                out[f * CHANNELS + c] = self.buf.pop_front().unwrap_or(0.0) * g;
+            self.next_frame(&mut out[n * CHANNELS..(n + 1) * CHANNELS]);
+            if g < 1.0 {
+                out[n * CHANNELS..(n + 1) * CHANNELS].iter_mut().for_each(|v| *v *= g);
             }
+            n += 1;
         }
-        if take < want {
-            out[take * CHANNELS..].fill(0.0);
-            self.silent_frames += (want - take) as u64;
+        // the last frames of the queue while correcting: play them out unchanged
+        while n < want && self.frames() > 0 && !self.locked && must_fill {
+            for c in 0..CHANNELS {
+                out[n * CHANNELS + c] = self.buf.pop_front().unwrap_or(0.0);
+                self.prev[c] = out[n * CHANNELS + c];
+            }
+            n += 1;
+        }
+        if n > 0 {
+            self.steer(n);
+        }
+        if !must_fill {
+            self.pulled_frames += n as u64;
+            return n;
+        }
+        self.pulled_frames += want as u64;
+        if n < want {
+            out[n * CHANNELS..].fill(0.0);
+            self.silent_frames += (want - n) as u64;
             self.underruns += 1;
             self.primed = false;
         }
@@ -357,6 +523,92 @@ mod tests {
         assert_eq!(j.underruns, 0);
         assert_eq!(j.pull_upto(&mut out, false), 0);
         assert_eq!(j.underruns, 0, "an empty queue is not an underrun while the device has slack");
+    }
+
+    /// Simulates capture (10 ms packets of a 1 kHz sine, with optional losses) and the
+    /// device (pulls every 1 ms, `drift` = how much faster its clock runs). Returns the
+    /// output (left channel), the jitter buffer, and the level just before each push.
+    fn simulate(start_ms: usize, secs: usize, drift: f64, lose_at_ms: &[(usize, usize)]) -> (Vec<f32>, Jitter, Vec<usize>) {
+        let rate = 48_000u32;
+        let mut j = Jitter::new(rate as usize * start_ms / 1000, rate as usize * (start_ms + 20) / 1000, rate);
+        let w = 2.0 * std::f64::consts::PI * 1000.0 / rate as f64;
+        let mut src_n: u64 = 0; // source sample index (losses skip ahead)
+        let mut out_l = Vec::new();
+        let mut levels = Vec::new();
+        let mut owed = 0.0f64;
+        let mut next_push = 0usize;
+        let mut pending: Vec<(usize, usize)> = lose_at_ms.to_vec();
+        for ms in 0..secs * 1000 {
+            if ms == next_push {
+                // As measured (diag_packets_on_stream_open): the engine stalls for `lost`
+                // ms; the next packet arrives that much later, its audio continues
+                // `lost` ms further on, and all later packets keep the shifted schedule.
+                if let Some(i) = pending.iter().position(|(at, _)| *at <= ms) {
+                    let (_, lost) = pending.remove(i);
+                    src_n += (lost * 48) as u64;
+                    next_push += lost;
+                } else {
+                    next_push += 10;
+                    levels.push(j.frames());
+                    let pkt: Vec<f32> = (0..480u64)
+                        .flat_map(|i| {
+                            let v = (0.1 * (w * (src_n + i) as f64).sin()) as f32;
+                            [v, v]
+                        })
+                        .collect();
+                    src_n += 480;
+                    j.push(&pkt);
+                }
+            }
+            owed += 48.0 * (1.0 + drift);
+            let n = owed as usize;
+            owed -= n as f64;
+            let mut out = vec![0.0f32; n * CHANNELS];
+            j.pull(&mut out);
+            out_l.extend(out.chunks(CHANNELS).map(|f| f[0]));
+        }
+        (out_l, j, levels)
+    }
+
+    /// Sine-predictor residual peaks above 0.005 (a dropped/inserted gap is ~0.1).
+    fn glitches(x: &[f32]) -> Vec<usize> {
+        let c = 2.0 * (2.0 * std::f32::consts::PI * 1000.0 / 48_000.0).cos();
+        (2..x.len()).filter(|&n| (x[n] - c * x[n - 1] + x[n - 2]).abs() > 0.005).collect()
+    }
+
+    #[test]
+    fn steady_flow_passes_samples_through_unchanged() {
+        let (out, j, _) = simulate(12, 3, 0.0, &[]);
+        assert_eq!(j.underruns, 0);
+        assert_eq!(j.corrected_frames, 0, "no rate correction needed");
+        assert!(glitches(&out[48 * 20..]).is_empty());
+    }
+
+    #[test]
+    fn lost_audio_is_absorbed_and_the_level_recovers() {
+        // the engine loses 8 ms at 1 s and 12 ms at 5 s (seen when other programs
+        // open/close streams). With a 25 ms start level there are 15 ms of margin; a
+        // plain FIFO would then be left with 7 ms and 0 ms less margin for good.
+        let (out, j, levels) = simulate(25, 12, 0.0, &[(1000, 8), (5000, 12)]);
+        assert_eq!(j.underruns, 0, "no underrun; levels before push around the losses: {:?}", &levels[95..130]);
+        let g: Vec<usize> = glitches(&out[48 * 20..]).iter().map(|n| (n + 48 * 20) / 48).collect();
+        // the source itself jumps at the losses (that phase jump is in the audio we get)
+        assert!(g.iter().all(|&ms| (1000..1040).contains(&ms) || (5000..5040).contains(&ms)), "glitches only where the source has them: {g:?}");
+        assert!(j.speed() == 1.0, "back to 1:1 pass-through at the end: {}", j.speed());
+        let end = &levels[levels.len() - 50..];
+        let avg = end.iter().sum::<usize>() as f64 / end.len() as f64 / 48.0;
+        assert!((13.5..=16.5).contains(&avg), "level before push back near start - packet (15 ms): {avg:.2} ms");
+    }
+
+    #[test]
+    fn clock_drift_is_followed_without_underruns() {
+        for (start, drift) in [(12, 0.0003), (12, -0.0003), (20, 0.0015), (20, -0.0015)] {
+            let (out, j, _) = simulate(start, 40, drift, &[]);
+            assert_eq!(j.underruns, 0, "drift {drift}");
+            assert_eq!(j.dropped_frames, 0, "drift {drift}: no overflow drops either");
+            assert!(glitches(&out[48 * 20..]).is_empty(), "drift {drift}: correction is glitch-free");
+            assert!((j.speed() - 1.0 / (1.0 + drift)).abs() < 0.0005, "drift {drift}: speed {} (device fast -> consume slower)", j.speed());
+        }
     }
 
     #[test]

@@ -35,7 +35,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use audio_exclude::config::Config;
-use audio_exclude::dsp::tone_level_db;
+use audio_exclude::dsp::{tone_level_db, tone_level_db_near};
 use audio_exclude::engine::{Engine, Event, Target};
 use audio_exclude::wasapi::{self, CaptureStream, CHANNELS, SAMPLE_RATE};
 use rustfft::{num_complex::Complex, FftPlanner};
@@ -322,7 +322,9 @@ fn record_both_valid(label: &str, ms: u64) -> (Recording, Recording) {
 }
 
 fn levels(r: &Recording) -> (f32, f32) {
-    (tone_level_db(&r.samples, RATE, F_KEPT), tone_level_db(&r.samples, RATE, F_EXCLUDED))
+    // +-0.6 %: capture may run its drift correction (at most 0.5 %) after an audio loss;
+    // for the excluded tone, searching a band only makes the check stricter
+    (tone_level_db_near(&r.samples, RATE, F_KEPT, 0.006), tone_level_db_near(&r.samples, RATE, F_EXCLUDED, 0.006))
 }
 
 /// Records 1 s and checks: the excluded tone is audible locally but ≥40 dB below the kept
@@ -751,20 +753,35 @@ fn t9_engine_retries_output() {
 fn sine_glitches(x: &[f32], freq: f32, thresh: f32) -> (Vec<f32>, f32) {
     let c = 2.0 * (2.0 * std::f32::consts::PI * freq / RATE).cos();
     let mut events: Vec<f32> = Vec::new();
-    let mut last = usize::MAX / 2;
+    let mut last: Option<usize> = None;
     let mut sum = 0.0f64;
     for n in 2..x.len() {
         let r = (x[n] - c * x[n - 1] + x[n - 2]).abs();
         sum += (r as f64) * (r as f64);
         if r > thresh {
-            if n.saturating_sub(last) > (RATE as usize / 200) {
+            // (the first exceedance is an event too; an earlier version missed it)
+            if last.is_none_or(|l| n - l > RATE as usize / 200) {
                 events.push(n as f32 * 1000.0 / RATE);
             }
-            last = n;
+            last = Some(n);
         }
     }
     let floor = audio_exclude::dsp::to_db((sum / x.len().max(1) as f64).sqrt() as f32);
     (events, floor)
+}
+
+/// The 5 largest sine-predictor residuals (one per 5 ms), as "time ms:value", time
+/// offset by `offset_ms`: shows near-misses below the glitch threshold too.
+fn top_residuals(x: &[f32], freq: f32, offset_ms: f32) -> String {
+    let c = 2.0 * (2.0 * std::f32::consts::PI * freq / RATE).cos();
+    let win = RATE as usize / 200;
+    let mut peaks: Vec<(f32, usize)> = (2..x.len())
+        .collect::<Vec<_>>()
+        .chunks(win)
+        .map(|ch| ch.iter().map(|&n| ((x[n] - c * x[n - 1] + x[n - 2]).abs(), n)).fold((0.0, 0), |m, v| if v.0 > m.0 { v } else { m }))
+        .collect();
+    peaks.sort_by(|a, b| b.0.total_cmp(&a.0));
+    peaks.iter().take(5).map(|(v, n)| format!("{:.0}:{v:.4}", *n as f32 * 1000.0 / RATE + offset_ms)).collect::<Vec<_>>().join(" ")
 }
 
 /// 10. No clicks/dropouts in the first seconds after capture starts (and afterwards):
@@ -808,16 +825,20 @@ fn t10_no_glitches_after_start() {
         let cg: Vec<f32> = cg.iter().filter(|&&t| t > 2.0).map(|t| t + onset_ms).collect();
         let ours: Vec<f32> = cg.iter().cloned().filter(|&t| !rg.iter().any(|&r| r <= t + 5.0 && r >= t - 60.0)).collect();
         let early = ours.iter().filter(|&&t| t < onset_ms + 3000.0).count();
-        println!(
-            "[t10 glitches] raw process loopback (reference): {} steps {:?}, floor {rfloor:.1} dB | cable: onset at {onset_ms:.0} ms, {} events {:?}, floor {cfloor:.1} dB | not explained by the reference: {} ({} in the first 3 s)",
+        let report = format!(
+            "[t10 glitches] raw process loopback (reference): {} steps {:?}, floor {rfloor:.1} dB, top residuals {} | cable: onset at {onset_ms:.0} ms, {} events {:?}, floor {cfloor:.1} dB, top residuals {} | not explained by the reference: {} ({} in the first 3 s) | times relative to qpc {:.1} ms",
             rg.len(),
             &rg[..rg.len().min(8)],
+            top_residuals(&raw.samples[raw_onset + 96..], F_EXCLUDED, (raw_onset + 96) as f32 * 1000.0 / RATE),
             cg.len(),
             &cg[..cg.len().min(8)],
+            top_residuals(&cable_al[onset + 96..], F_EXCLUDED, (onset + 96) as f32 * 1000.0 / RATE),
             ours.len(),
-            early
+            early,
+            raw.start_qpc as f64 / 1e4
         );
-        assert!(ours.is_empty(), "{} glitches introduced by capture after it started: {:?}", ours.len(), &ours[..ours.len().min(20)]);
+        println!("{report}");
+        assert!(ours.is_empty(), "{} glitches introduced by capture after it started: {:?}\n{report}", ours.len(), &ours[..ours.len().min(20)]);
         return;
     }
     panic!("no valid measurement in 3 attempts (recorders kept having gaps)");
@@ -1049,13 +1070,16 @@ fn unexplained_glitches(cable: &Recording, raw: &Recording, freq: f32) -> (Vec<f
     let ours: Vec<f32> = cg.iter().cloned().filter(|&t| !rg.iter().any(|&r| r <= t + 5.0 && r >= t - 60.0)).collect();
     let first = cable_al[onset..].iter().take(RATE as usize / 1000).fold(0.0f32, |m, v| m.max(v.abs()));
     let report = format!(
-        "raw loopback: {} steps, floor {rfloor:.1} dB | cable: starts {:.1} ms after raw loopback, peak in its first 1 ms {first:.3} (sine amplitude 0.1), {} events {:?}, floor {cfloor:.1} dB | unexplained: {} {:?}",
+        "raw loopback: {} steps, floor {rfloor:.1} dB, top residuals {} | cable: starts {:.1} ms after raw loopback, peak in its first 1 ms {first:.3} (sine amplitude 0.1), {} events {:?}, floor {cfloor:.1} dB, top residuals {} | unexplained: {} {:?} | times relative to qpc {:.1} ms",
         rg.len(),
+        top_residuals(&raw.samples[(raw_onset + 96).min(raw_end)..raw_end], freq, ms(raw_onset + 96)),
         ms(onset) - ms(raw_onset),
         cg.len(),
         &cg[..cg.len().min(8)],
+        top_residuals(&cable_al[(onset + 96).min(cable_end)..cable_end], freq, ms(onset + 96)),
         ours.len(),
-        &ours[..ours.len().min(8)]
+        &ours[..ours.len().min(8)],
+        raw.start_qpc as f64 / 1e4
     );
     (ours, report)
 }
@@ -1082,7 +1106,7 @@ fn t11_sound_after_silence() {
         }
         let (ours, report) = unexplained_glitches(&cable, &raw, F_EXCLUDED);
         println!("[t11 silence -> sound] {report}");
-        assert!(ours.is_empty(), "{} glitches in the cable after silence -> sound: {ours:?}", ours.len());
+        assert!(ours.is_empty(), "{} glitches in the cable after silence -> sound: {ours:?}\n{report}", ours.len());
         return;
     }
     panic!("no valid measurement in 3 attempts");
@@ -1104,7 +1128,11 @@ fn t12_silence_dither() {
         }
         let cap = start_capture(&args);
         thread::sleep(Duration::from_secs(1)); // nothing plays
-        let rec = record(Source::Cable, 2000).join().unwrap();
+        // a recorder-side gap would insert zeros of its own: measure again (up to 3 times)
+        let rec = (1..=3)
+            .map(|_| record(Source::Cable, 2000).join().unwrap())
+            .find(|r| r.gaps == 0)
+            .expect("cable recorder had gaps in 3 attempts");
         let s = &rec.samples[RATE as usize / 10..]; // skip the recorder's start-up
         let blocks: Vec<&[f32]> = s.chunks_exact(RATE as usize / 100).collect();
         let zero_samples = s.iter().filter(|v| **v == 0.0).count();
@@ -1118,7 +1146,6 @@ fn t12_silence_dither() {
             blocks.len(),
             audio_exclude::dsp::to_db(peak)
         );
-        assert!(rec.gaps == 0, "cable recorder had gaps; rerun");
         if dither {
             assert_eq!(all_zero_blocks, 0, "no 10 ms block may be all zeros");
             assert_eq!(zero_samples, 0, "no sample may be an exact zero");
@@ -1131,11 +1158,98 @@ fn t12_silence_dither() {
             let (cable, raw) = (cable.join().unwrap(), raw.join().unwrap());
             let (ours, report) = unexplained_glitches(&cable, &raw, F_EXCLUDED);
             println!("[t12 dither on, tone] {report}");
-            assert!(ours.is_empty(), "glitches with dither on: {ours:?}");
+            assert!(ours.is_empty(), "glitches with dither on: {ours:?}\n{report}");
         } else {
             assert_eq!(zero_samples, s.len(), "without the switch silence stays exact zeros");
         }
         drop(cap);
         thread::sleep(Duration::from_millis(300));
     }
+}
+
+/// Diagnostic (ignored): a continuous 1000 Hz tone for `AUDIO_EXCLUDE_LONG_MS` (default
+/// 20000) ms through capture; counts cable glitches the raw loopback doesn't explain.
+/// Run with AUDIO_EXCLUDE_STATS=1 to see capture's per-second underruns.
+#[test]
+#[ignore]
+fn diag_long_run() {
+    let _g = serial();
+    let ms: u64 = std::env::var("AUDIO_EXCLUDE_LONG_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(20000);
+    let dummy = start_dummy();
+    let pid = dummy.pid().to_string();
+    let _cap = start_capture(&["--exclude-pid", &pid]);
+    let dur = (ms + 3000).to_string();
+    let _t = start_tone(&tone_exe(), F_EXCLUDED, &["--duration", &dur]);
+    thread::sleep(Duration::from_millis(500));
+    let cable = record(Source::Cable, ms);
+    let raw = record(Source::ProcessLoopback(dummy.pid()), ms);
+    // AUDIO_EXCLUDE_INJECT=1: every 1.5 s another process opens a (silent) stream for 0.5 s
+    let mut opened = Vec::new();
+    if std::env::var_os("AUDIO_EXCLUDE_INJECT").is_some() {
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_millis(ms.saturating_sub(1500)) {
+            thread::sleep(Duration::from_millis(1000));
+            opened.push(t0.elapsed().as_millis());
+            let _o = start_tone(&tone_exe(), 0.0, &["--duration", "500"]);
+            thread::sleep(Duration::from_millis(500));
+        }
+    }
+    let (cable, raw) = (cable.join().unwrap(), raw.join().unwrap());
+    let (ours, report) = unexplained_glitches(&cable, &raw, F_EXCLUDED);
+    println!("[diag long run] other streams opened at {opened:?} ms");
+    println!("[diag long run {ms} ms] recorder gaps cable {} raw {} | {report}", cable.gaps, raw.gaps);
+    println!("[diag long run] unexplained glitches: {} = {:.1} per minute, at {:?}", ours.len(), ours.len() as f64 * 60000.0 / ms as f64, ours);
+}
+
+/// Diagnostic (ignored): per-packet log of raw process loopback while another process
+/// opens and closes a stream: arrival time, QPC timestamp, frames, flags. Shows whether
+/// such events lose audio (timestamp jumps) or only delay delivery.
+#[test]
+#[ignore]
+fn diag_packets_on_stream_open() {
+    let _g = serial();
+    let dummy = start_dummy();
+    let _t = start_tone(&tone_exe(), F_EXCLUDED, &["--duration", "6000"]);
+    thread::sleep(Duration::from_millis(300));
+    wasapi::init_com().unwrap();
+    let mut cap = CaptureStream::process_loopback(dummy.pid(), false, 20, SAMPLE_RATE).unwrap();
+    let t0 = Instant::now();
+    let mut log: Vec<(f64, u64, usize, u32)> = Vec::new();
+    let mut samples: Vec<f32> = Vec::new();
+    let mut other: Option<Proc> = None;
+    let mut marks = Vec::new();
+    while t0.elapsed() < Duration::from_millis(3000) {
+        let ms = t0.elapsed().as_millis();
+        if ms > 1000 && marks.is_empty() {
+            marks.push(("open", ms));
+            other = Some(start_tone(&tone_exe(), 0.0, &["--duration", "800"]));
+        }
+        if ms > 2200 && marks.len() == 1 {
+            marks.push(("closed by", ms));
+            other = None;
+        }
+        cap.wait(Duration::from_millis(50));
+        cap.read(|p| {
+            log.push((t0.elapsed().as_secs_f64() * 1000.0, p.qpc_100ns, p.samples.len() / CHANNELS, p.flags));
+            samples.extend(p.samples.chunks(CHANNELS).map(|f| f[0]));
+        })
+        .unwrap();
+    }
+    drop(other);
+    println!("[diag packets] marks {marks:?}");
+    let q0 = log[0].1;
+    let mut frames_total = 0usize;
+    for (i, (at, q, n, fl)) in log.iter().enumerate() {
+        let dq = if i > 0 { (*q as f64 - log[i - 1].1 as f64) / 1e4 } else { 0.0 };
+        let da = if i > 0 { at - log[i - 1].0 } else { 0.0 };
+        let qms = (*q - q0) as f64 / 1e4;
+        // data position vs timestamp: drift > 0 means the timestamp ran ahead of the data
+        let drift = qms - frames_total as f64 * 1000.0 / RATE as f64;
+        if dq > 10.5 || dq < 9.5 || da > 13.0 || *fl != 0 || drift.abs() > 1.0 {
+            println!("  #{i} arrive {at:.1} (+{da:.1}) qpc +{qms:.1} (+{dq:.1}) frames {n} flags {fl:#x} ts-minus-data {drift:.1} ms");
+        }
+        frames_total += n;
+    }
+    let (ev, floor) = sine_glitches(&samples[RATE as usize / 100..], F_EXCLUDED, 0.005);
+    println!("[diag packets] {} packets, data {:.1} ms vs timestamps {:.1} ms; contiguous-data glitches {} {:?} (floor {floor:.1} dB), top {}", log.len(), frames_total as f64 * 1000.0 / RATE as f64, (log.last().unwrap().1 - q0) as f64 / 1e4 + 10.0, ev.len(), ev, top_residuals(&samples[RATE as usize / 100..], F_EXCLUDED, 10.0));
 }

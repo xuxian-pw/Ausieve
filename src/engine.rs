@@ -12,10 +12,12 @@ use crate::procs;
 use crate::wasapi::{self, CaptureStream};
 
 /// Default jitter-buffer start level (see [`Output::open`]). Process loopback delivers
-/// 10 ms packets, so this must be > 10; the margin above 10 absorbs timing jitter.
-/// Measured end-to-end (t6): 11 ms ~28 ms, 12 ms ~29 ms, 15 ms ~32 ms; all glitch-free
-/// in t10 on the development machine.
-pub const DEFAULT_BUFFER_MS: u32 = 12;
+/// 10 ms packets, so this must be > 10. The margin above 10 is what absorbs the few ms
+/// of audio that Windows loses whenever any program opens or closes a stream (seen:
+/// 4-15 ms per event): with 12 ms that margin is only ~2 ms and the full test suite
+/// glitched in 2 of 6 runs, with 20 ms in 0 of 6. End-to-end latency (t6): 12 ms ~29 ms,
+/// 20 ms ~36 ms.
+pub const DEFAULT_BUFFER_MS: u32 = 20;
 /// Highest accepted value.
 pub const MAX_BUFFER_MS: u32 = 200;
 /// Lowest accepted value: below one capture packet the output would underrun constantly.
@@ -327,6 +329,9 @@ struct Stats {
     /// Lines go to a printer thread: writing to a (piped) stderr from the capture
     /// thread can block it long enough to cause underruns.
     printer: Option<mpsc::Sender<String>>,
+    last_qpc: Option<u64>,
+    prev_arrival: Option<Instant>,
+    seen_underruns: u64,
 }
 
 impl Stats {
@@ -346,6 +351,9 @@ impl Stats {
             max_queue: 0,
             prev: OutputStats::default(),
             printer: None,
+            last_qpc: None,
+            prev_arrival: None,
+            seen_underruns: 0,
         };
         if on {
             let (tx, rx) = mpsc::channel::<String>();
@@ -388,6 +396,29 @@ impl Stats {
             self.discontinuities += 1;
         }
         self.max_cap_delay_100ns = self.max_cap_delay_100ns.max(wasapi::qpc_now_100ns().saturating_sub(qpc));
+        // Individual events, with absolute QPC times (ms) for correlating with recordings:
+        // a timestamp step larger than the previous packet means audio the engine never
+        // delivered (lost), a large arrival gap with a normal step means late delivery.
+        let gap_ms = self.last_pkt_gap_ms(now);
+        if let Some(prev) = self.last_qpc {
+            let step_ms = (qpc as f64 - prev as f64) / 10_000.0;
+            let pkt_ms = frames as f64 * 1000.0 / self.rate as f64;
+            if step_ms > pkt_ms + 0.5 || gap_ms > 13.0 {
+                self.send(format!("event: packet at qpc {:.1} ms, arrival gap {gap_ms:.1} ms, timestamp step {step_ms:.1} ms ({:.1} ms of audio missing)", qpc as f64 / 10_000.0, (step_ms - pkt_ms).max(0.0)));
+            }
+        }
+        self.last_qpc = Some(qpc);
+        self.prev_arrival = Some(now);
+    }
+
+    fn last_pkt_gap_ms(&self, now: Instant) -> f64 {
+        self.prev_arrival.map(|t| (now - t).as_secs_f64() * 1000.0).unwrap_or(0.0)
+    }
+
+    fn send(&self, line: String) {
+        if let Some(p) = &self.printer {
+            let _ = p.send(line);
+        }
     }
 
     fn maybe_print(&mut self, o: OutputStats) {
@@ -396,6 +427,10 @@ impl Stats {
         }
         self.min_queue = self.min_queue.min(o.queued_frames);
         self.max_queue = self.max_queue.max(o.queued_frames);
+        if o.underruns > self.seen_underruns {
+            self.seen_underruns = o.underruns;
+            self.send(format!("event: underrun noticed at qpc {:.1} ms (within one packet)", wasapi::qpc_now_100ns() as f64 / 10_000.0));
+        }
         if self.since.elapsed() < Duration::from_secs(1) {
             return;
         }
