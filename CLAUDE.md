@@ -1,6 +1,6 @@
 # audio-exclude
 
-Windows 工具：用 WASAPI process loopback 采集“除某个程序外”的全部系统声音，写进虚拟声卡（默认 `Line 1 (Virtual Audio Cable)`），被控端的 RustDesk 把 Audio input 设成这条线的录音端。用法、参数、每个测试用例的断言、测试用的环境变量都在 `README.md`，这里只记录看代码看不出来的东西。
+Windows 工具：用 WASAPI process loopback 采集“除某个程序外”的全部系统声音，写进虚拟声卡（默认 `Line 1 (Virtual Audio Cable)`），被控端的 RustDesk 把 Audio input 设成这条线的录音端。用法和参数在 `README.md`，测试用例的断言和测试用的环境变量在 `docs/testing.md`，延迟构成和各次杂音修复的实测在 `docs/design.md`，这里只记录看代码看不出来的东西。
 
 ## 协作约定
 
