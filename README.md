@@ -27,6 +27,16 @@ cargo build --release
 - `target\release\capture.exe`：命令行版本。
 - `target\release\tone.exe`：测试辅助程序。
 
+### 安装包
+
+装了 [Inno Setup 6](https://jrsoftware.org/isinfo.php) 后，在 `cargo build --release` 之后运行：
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" /DAppVersion=0.1.0 installerudio-exclude.iss
+```
+
+生成 `target\installerudio-exclude-setup-<版本>.exe`。安装包默认装到当前用户（不需要管理员），包含 `tray.exe`、`capture.exe`，可选开机自启动和桌面快捷方式；卸载时只关闭安装目录里的 `tray.exe`，保留 `%APPDATA%udio-exclude` 里的设置。
+
 图标在 `assets/`：`app.ico` 是正常状态，`warn.ico` 是托盘在输出或采集出错时显示的版本，由 `build.rs` 通过 `assets/app.rc` 编进每个 exe。构建要用到 Windows SDK 里的 `rc.exe`。两个 `.ico` 是 `python assets/make_icons.py`（需要 Pillow）生成的，已经提交进仓库，平时构建不需要 Python。改图标时改这个脚本再重新生成，它会顺便输出 `assets/preview.png`（不提交）方便预览。
 
 ## 托盘程序（推荐）
@@ -58,7 +68,7 @@ cargo build --release
   - `"silence_dither": true`：静音时写入约 -90dBFS 的 ±1 LSB 噪声（人耳听不到），而不是完全的数字零，防止接收端检测到连续全零后暂停编码（RustDesk 约 8 秒全零后停止编码）。A/B 对比证明它和之前的杂音无关，默认关。
   设置环境变量 `AUDIO_EXCLUDE_CONFIG` 可以指定其他配置文件路径。
 - 只能运行一个实例，否则两个实例会争抢同一个独占的输出设备。
-- 目前没有开机自启动。需要的话，可以手动把 `tray.exe` 的快捷方式放进 `shell:startup` 文件夹。
+- 用安装包安装时可以勾选开机自启动；手动部署的话，可以把 `tray.exe` 的快捷方式放进 `shell:startup` 文件夹。
 
 ## 命令行
 
