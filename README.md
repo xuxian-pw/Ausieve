@@ -107,6 +107,7 @@ powershell -ExecutionPolicy Bypass -File installer\build.ps1
 
 ## 更多文档
 
+- [docs/troubleshooting.md](docs/troubleshooting.md)：虚拟线没有声音、声音像被降噪时怎么排查。
 - [docs/testing.md](docs/testing.md)：自动化测试、每个用例的断言、测试用的环境变量。
 - [docs/design.md](docs/design.md)：延迟构成，以及几次杂音问题的原因、修法和实测数据。
 - [docs/audio-notes.md](docs/audio-notes.md)：音频管线的关键结论，修改相关代码前先读。
