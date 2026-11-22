@@ -1,4 +1,4 @@
-//! Persistent settings of the tray app (`%APPDATA%\Ausieve\config.json`).
+//! Persistent settings of the tray app (`%APPDATA%\Ausieve\config.toml`).
 
 use std::path::{Path, PathBuf};
 
@@ -44,24 +44,10 @@ impl Config {
         self.buffer_ms.unwrap_or(crate::engine::DEFAULT_BUFFER_MS)
     }
 
-    /// `%APPDATA%\Ausieve\config.json`
+    /// `%APPDATA%\Ausieve\config.toml`
     pub fn default_path() -> PathBuf {
         let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-        base.join("Ausieve").join("config.json")
-    }
-
-    /// Before the rename the settings lived in `%APPDATA%\audio-exclude\config.json`;
-    /// copies that file to `path` once if `path` does not exist yet.
-    pub fn migrate_legacy(path: &Path) {
-        let Some(base) = std::env::var_os("APPDATA").map(PathBuf::from) else { return };
-        let old = base.join("audio-exclude").join("config.json");
-        if path.exists() || !old.exists() {
-            return;
-        }
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::copy(&old, path);
+        base.join("Ausieve").join("config.toml")
     }
 
     /// The settings of a first run: the defaults plus [`PRESET_PROGRAMS`].
@@ -73,7 +59,7 @@ impl Config {
     pub fn load(path: &Path) -> Result<Config, String> {
         match std::fs::read_to_string(path) {
             Ok(s) => {
-                let mut c: Config = serde_json::from_str(&s).map_err(|e| format!("{}: {e}", path.display()))?;
+                let mut c: Config = toml::from_str(&s).map_err(|e| format!("{}: {e}", path.display()))?;
                 c.fix_up();
                 Ok(c)
             }
@@ -87,8 +73,8 @@ impl Config {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
-        let tmp = path.with_extension("json.tmp");
-        let s = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        let tmp = path.with_extension("toml.tmp");
+        let s = toml::to_string(self).map_err(|e| e.to_string())?;
         std::fs::write(&tmp, s).map_err(|e| format!("{}: {e}", tmp.display()))?;
         std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
     }
@@ -145,7 +131,7 @@ mod tests {
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("ausieve-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
-        d.join("sub").join("config.json")
+        d.join("sub").join("config.toml")
     }
 
     #[test]
@@ -194,18 +180,18 @@ mod tests {
     fn hand_edited_files_are_repaired_or_rejected() {
         let p = tmp("repair");
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(&p, r#"{"programs":["C:\\x.exe","c:\\X.exe"],"selected":"C:\\gone.exe","output":""}"#).unwrap();
+        std::fs::write(&p, "programs = ['C:\\x.exe', 'c:\\X.exe']\nselected = 'C:\\gone.exe'\noutput = ''\n").unwrap();
         let c = Config::load(&p).unwrap();
         assert_eq!(c.programs, vec![r"C:\x.exe".to_string()]);
         assert_eq!(c.selected, None);
         assert_eq!(c.output, DEFAULT_OUTPUT);
         assert_eq!(c.buffer_ms(), crate::engine::DEFAULT_BUFFER_MS, "missing field gets the default");
         assert!(!c.silence_dither, "dither is off by default");
-        std::fs::write(&p, r#"{"buffer_ms":1}"#).unwrap();
+        std::fs::write(&p, "buffer_ms = 1").unwrap();
         assert_eq!(Config::load(&p).unwrap().buffer_ms(), crate::engine::MIN_BUFFER_MS, "clamped");
-        std::fs::write(&p, r#"{"buffer_ms":15}"#).unwrap();
+        std::fs::write(&p, "buffer_ms = 15").unwrap();
         assert_eq!(Config::load(&p).unwrap().buffer_ms(), 15, "hand-set value is used");
-        std::fs::write(&p, "not json").unwrap();
+        std::fs::write(&p, "not toml = [").unwrap();
         assert!(Config::load(&p).is_err());
         let _ = std::fs::remove_dir_all(p.parent().unwrap().parent().unwrap());
     }

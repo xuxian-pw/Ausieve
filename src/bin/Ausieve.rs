@@ -1,6 +1,6 @@
 //! System-tray front end: pick which program's sound to exclude, switch between added
 //! programs, pick the output device. Settings persist in
-//! `%APPDATA%\Ausieve\config.json`; capture resumes automatically on start.
+//! `%APPDATA%\Ausieve\config.toml`; capture resumes automatically on start.
 
 #![windows_subsystem = "windows"]
 // The binary is named Ausieve so Task Manager shows Ausieve.exe.
@@ -442,17 +442,13 @@ fn main() {
 
         let cfg_path = match std::env::var_os("AUSIEVE_CONFIG") {
             Some(p) => PathBuf::from(p),
-            None => {
-                let p = Config::default_path();
-                Config::migrate_legacy(&p);
-                p
-            }
+            None => Config::default_path(),
         };
         let (cfg, load_err) = match Config::load(&cfg_path) {
             Ok(c) => (c, None),
             Err(e) => {
                 // keep the broken file for the user, start with defaults
-                let bad = cfg_path.with_extension("json.bad");
+                let bad = cfg_path.with_extension("toml.bad");
                 let _ = std::fs::rename(&cfg_path, &bad);
                 (Config::default(), Some(format!("{e}\n已改名为 {}，使用默认设置。", bad.display())))
             }

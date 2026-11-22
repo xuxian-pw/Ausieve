@@ -666,7 +666,7 @@ fn t8_tray_restores_config_and_switches() {
     assert!(tray_win::find().is_none(), "a tray instance is already running; quit it before running the tests");
     let excluded = same_name_copy("tray_a");
     let excluded_s = excluded.to_str().unwrap().to_string();
-    let cfg_path = Path::new(env!("CARGO_TARGET_TMPDIR")).join("tray_cfg").join("config.json");
+    let cfg_path = Path::new(env!("CARGO_TARGET_TMPDIR")).join("tray_cfg").join("config.toml");
     let mut cfg = Config { output: cable_name(), ..Config::default() };
     cfg.add_program(&excluded_s);
     cfg.select(Some(&excluded_s));
