@@ -7,6 +7,10 @@ Windows 工具：用 WASAPI process loopback 采集“除某个程序外”的�
 - 文档、注释以外的说明和提交讨论用中文。
 - 最终验收是通过 RustDesk 实际听：同一个场景，把 Audio input 分别设成 System sound 和 Line 1，对比两边。测试通过只说明可以拿去试听了。
 
+## 排障
+
+使用者报告远程没有声音或声音不对时，先读 `docs/troubleshooting.md`：里面是目标、已知事实和陷阱，怎么查自己判断。测量可以用 `scripts/diagnose.ps1`。`scripts/` 是开发工具，不放进安装包。
+
 ## 跑测试
 
 - 测试使用真实设备，会从默认输出播放测试音，并独占 Line 1。`Ausieve.exe` 在运行时，测试打不开 Line 1，`cargo build --release` 也写不进 exe。遇到这种情况，请使用者从托盘菜单点“退出”，不要直接结束这个进程。
