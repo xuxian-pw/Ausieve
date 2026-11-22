@@ -214,7 +214,7 @@ impl App {
             for (i, p) in self.cfg.programs.iter().enumerate() {
                 let selected = self.cfg.selected.as_deref().is_some_and(|s| normalize_path(s) == normalize_path(p));
                 let running = if selected { self.status.target_pid.is_some() } else { procs::find_root_by_path(p).is_some() };
-                let missing = !std::path::Path::new(p).exists();
+                let missing = !procs::program_exists(p);
                 let mut text = label(&self.cfg, p);
                 if missing {
                     text.push_str("（文件不存在）");

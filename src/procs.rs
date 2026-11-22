@@ -106,6 +106,119 @@ pub fn normalize_path(p: &str) -> String {
     s.to_lowercase()
 }
 
+/// Expands `%NAME%` environment variables. Unknown names and an unpaired `%` stay as
+/// written.
+pub fn expand_env(p: &str) -> String {
+    let mut out = String::new();
+    let mut rest = p;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        match after.find('%') {
+            Some(j) if j > 0 => {
+                let name = &after[..j];
+                match std::env::var(name) {
+                    Ok(v) => out.push_str(&v),
+                    Err(_) => {
+                        out.push('%');
+                        out.push_str(name);
+                        out.push('%');
+                    }
+                }
+                rest = &after[j + 1..];
+            }
+            _ => {
+                out.push('%');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn has_wildcard(s: &str) -> bool {
+    s.contains(['*', '?'])
+}
+
+/// Case-insensitive glob match of one path segment: `*` = any run of characters,
+/// `?` = one character.
+fn segment_matches(pattern: &str, s: &str) -> bool {
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    let s: Vec<char> = s.to_lowercase().chars().collect();
+    let (mut pi, mut si) = (0, 0);
+    let mut star: Option<(usize, usize)> = None; // (pattern index after '*', s index it took)
+    while si < s.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == s[si]) {
+            pi += 1;
+            si += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some((pi + 1, si));
+            pi += 1;
+        } else if let Some((sp, ss)) = star {
+            pi = sp;
+            si = ss + 1;
+            star = Some((sp, ss + 1));
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
+}
+
+/// True if the executable `path` is the program `pattern` (as stored in the config): an
+/// exact path, or one with `*` / `?` inside folder or file names (they never span a
+/// `\`), e.g. `%LOCALAPPDATA%\Discord\app-*\Discord.exe` for apps that move to a new
+/// version folder on every update. `%NAME%` variables are expanded.
+pub fn path_matches(pattern: &str, path: &str) -> bool {
+    let pat = normalize_path(&expand_env(pattern));
+    let path = normalize_path(path);
+    if !has_wildcard(&pat) {
+        return pat == path;
+    }
+    let ps: Vec<&str> = pat.split('\\').collect();
+    let xs: Vec<&str> = path.split('\\').collect();
+    ps.len() == xs.len() && ps.iter().zip(&xs).all(|(p, x)| segment_matches(p, x))
+}
+
+/// True if at least one file matches the program `pattern` (see [`path_matches`]).
+pub fn program_exists(pattern: &str) -> bool {
+    let p = expand_env(pattern);
+    if !has_wildcard(&p) {
+        return std::path::Path::new(&p).exists();
+    }
+    let norm = normalize_path(&p);
+    let mut segs = norm.split('\\');
+    let root = segs.next().unwrap_or("");
+    if root.is_empty() || has_wildcard(root) {
+        return true; // UNC path or wildcard drive: not worth checking, assume it is there
+    }
+    let mut cands = vec![std::path::PathBuf::from(format!("{root}\\"))];
+    for seg in segs {
+        let mut next = Vec::new();
+        for c in &cands {
+            if has_wildcard(seg) {
+                let Ok(rd) = std::fs::read_dir(c) else { continue };
+                for e in rd.flatten() {
+                    if segment_matches(seg, &e.file_name().to_string_lossy()) {
+                        next.push(e.path());
+                    }
+                }
+            } else {
+                let j = c.join(seg);
+                if j.exists() {
+                    next.push(j);
+                }
+            }
+        }
+        if next.is_empty() {
+            return false;
+        }
+        cands = next;
+    }
+    true
+}
+
 /// File-name part of a path (`C:\a\b.exe` -> `b.exe`).
 pub fn file_name(p: &str) -> &str {
     p.rsplit(['\\', '/']).next().unwrap_or(p)
@@ -139,16 +252,17 @@ pub fn find_root(name: &str) -> Option<u32> {
 }
 
 /// Like [`find_root`], but matches the full executable path, so two different programs
-/// that happen to share a file name are told apart.
+/// that happen to share a file name are told apart. `path` may be a pattern (see
+/// [`path_matches`]).
 pub fn find_root_by_path(path: &str) -> Option<u32> {
-    let want = normalize_path(path);
-    let name = file_name(path);
+    let expanded = normalize_path(&expand_env(path));
+    let name = file_name(&expanded);
     let procs = snapshot();
     let matching: HashSet<u32> = procs
         .iter()
         // cheap name filter first; the full path needs an OpenProcess per candidate
-        .filter(|p| p.name.eq_ignore_ascii_case(name))
-        .filter(|p| process_path(p.pid).is_some_and(|pp| normalize_path(&pp) == want))
+        .filter(|p| segment_matches(name, &p.name))
+        .filter(|p| process_path(p.pid).is_some_and(|pp| path_matches(path, &pp)))
         .map(|p| p.pid)
         .collect();
     pick_root(&procs, &matching, creation_time)
@@ -174,6 +288,46 @@ mod tests {
     }
 
     #[test]
+    fn path_patterns() {
+        let d = r"%LOCALAPPDATA%\Discord\app-*\Discord.exe";
+        let base = std::env::var("LOCALAPPDATA").unwrap();
+        assert!(path_matches(d, &format!(r"{base}\Discord\app-1.0.9269\Discord.exe")));
+        assert!(path_matches(d, &format!(r"{base}\DISCORD\app-1.0.9270\discord.EXE")));
+        assert!(!path_matches(d, &format!(r"{base}\Discord\Update.exe")), "wrong depth");
+        assert!(!path_matches(d, &format!(r"{base}\Discord\app-1\x\Discord.exe")), "* does not span folders");
+        assert!(!path_matches(d, &format!(r"{base}\DiscordPTB\app-1.0.1\Discord.exe")));
+        assert!(!path_matches(d, r"C:\Other\Discord\app-1.0.9269\Discord.exe"));
+        assert!(path_matches(r"C:\A\v?.?\x*.exe", r"c:\a\v1.2\xyz.exe"));
+        assert!(!path_matches(r"C:\A\v?.?\x*.exe", r"c:\a\v10.2\xyz.exe"));
+        // no wildcard: exact, as before
+        assert!(path_matches(r"C:\A\a.exe", r"\\?\c:/a/A.EXE"));
+        assert!(!path_matches(r"C:\A\a.exe", r"C:\B\a.exe"));
+        assert!(segment_matches("*", "") && segment_matches("a*b*c", "aXbYbc") && !segment_matches("a*b", "ab_"));
+    }
+
+    #[test]
+    fn env_expansion() {
+        let windir = std::env::var("WINDIR").unwrap();
+        assert_eq!(expand_env(r"%windir%\x"), format!(r"{windir}\x"));
+        assert_eq!(expand_env(r"%NO_SUCH_VAR_AUSIEVE%\x"), r"%NO_SUCH_VAR_AUSIEVE%\x");
+        assert_eq!(expand_env("100% sure %%"), "100% sure %%");
+    }
+
+    #[test]
+    fn program_exists_with_patterns() {
+        let d = std::env::temp_dir().join(format!("ausieve-glob-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("app-1.0.1")).unwrap();
+        std::fs::write(d.join("app-1.0.1").join("Tool.exe"), b"").unwrap();
+        let ds = d.to_str().unwrap();
+        assert!(program_exists(&format!(r"{ds}\app-*\Tool.exe")));
+        assert!(program_exists(&format!(r"{ds}\app-1.0.1\Tool.exe")));
+        assert!(!program_exists(&format!(r"{ds}\app-*\Other.exe")));
+        assert!(!program_exists(&format!(r"{ds}\v*\Tool.exe")));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn root_is_the_process_whose_parent_is_not_the_same_app() {
         // 10 (launcher) -> 20 (app) -> 21 -> 22 (app children); 30 (app, second root)
         let procs = vec![p(10, 1), p(20, 10), p(21, 20), p(22, 21), p(30, 10)];
@@ -194,5 +348,10 @@ mod tests {
         // the test binary has no same-path parent, so it is its own root
         assert_eq!(find_root_by_path(me.to_str().unwrap()), Some(pid));
         assert_eq!(find_root_by_path(r"C:\definitely\not\here\x.exe"), None);
+        // the same exe through a pattern on its folder and file name
+        let dir = me.parent().unwrap();
+        let stem = me.file_stem().unwrap().to_str().unwrap();
+        let pat = format!(r"{}\*\{}*.exe", dir.parent().unwrap().display(), &stem[..3]);
+        assert_eq!(find_root_by_path(&pat), Some(pid), "{pat}");
     }
 }

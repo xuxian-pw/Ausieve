@@ -22,7 +22,7 @@
 ## 快速上手
 
 1. 运行 Ausieve，系统托盘里会出现它的图标。
-2. 单击图标 → **添加程序…** → 选中要排除的程序的 exe（例如 `Discord.exe`）。
+2. 单击图标，在列表里选中要排除的程序。列表里预置了 Discord；别的程序用 **添加程序…** 选中它的 exe。
 3. 单击图标 → **输出设备** → 选虚拟声卡的**播放端**（默认已经是 `Line 1`）。
 4. 在被控端的 RustDesk 设置里，把 **音频输入（Audio input）** 设为虚拟声卡的**录音端**，例如 `Line 1 (Virtual Audio Cable)` 或 `CABLE Output (VB-Audio Virtual Cable)`。
 
@@ -43,12 +43,13 @@
 
 - **一次只能排除一个程序**（Windows API 的限制），所以列表是单选。点另一项马上切换，不用重启。
 - **按完整路径匹配**：只排除路径完全相同的那个 exe，同名的其他程序不受影响。它连带启动的子进程也会一起排除。程序还没启动、退出或重启后都会自动跟上；没在运行时转发全部声音。
+- **路径通配符**：有的程序每次更新都换一个版本文件夹（例如 Discord 的 `app-1.0.9269`），选中的具体路径更新后就匹配不上了。这时可以手动在配置文件的 `programs` 里写带通配符的路径：`*` 匹配任意多个字符，`?` 匹配一个字符，都不跨越 `\`；`%LOCALAPPDATA%` 这类环境变量会展开。预置的 Discord 就是 `%LOCALAPPDATA%\Discord\app-*\Discord.exe`，写进 JSON 是 `"%LOCALAPPDATA%\\Discord\\app-*\\Discord.exe"`（`\` 要写成 `\\`）。同一个模式匹配到多个独立的程序时，只排除最早启动的那个。
 - **状态**：鼠标悬停在图标上显示当前排除的程序、它是否在运行、输出设备是否正常。输出设备找不到或被别的程序占用时，会弹出通知、图标变成警告样式，并每 2 秒自动重试。
 - 只能运行一个实例。
 
 ## 设置
 
-设置保存在 `%APPDATA%\Ausieve\config.json`，启动时自动恢复并开始采集，卸载时保留。文件损坏时会改名为 `config.json.bad`，然后用默认设置启动。环境变量 `AUSIEVE_CONFIG` 可以指定别的路径。
+设置保存在 `%APPDATA%\Ausieve\config.json`，启动时自动恢复并开始采集，卸载时保留。第一次运行时列表里预置了 Discord（不选中）。文件损坏时会改名为 `config.json.bad`，然后用默认设置启动。环境变量 `AUSIEVE_CONFIG` 可以指定别的路径。
 
 下面两项不在菜单里，需要时手动写进配置文件再重启程序：
 
@@ -69,7 +70,7 @@ capture.exe --exclude-name Discord.exe --output "Line 1 (Virtual Audio Cable)"
 | 参数 | 含义 |
 |---|---|
 | `--exclude-name NAME.exe` | 按进程名排除，自动找到同名的根进程，排除整棵进程树。每 250ms 检查一次，程序重启后自动跟上。 |
-| `--exclude-path PATH` | 按 exe 完整路径排除（与托盘程序相同）。 |
+| `--exclude-path PATH` | 按 exe 完整路径排除（与托盘程序相同，也支持通配符和环境变量）。 |
 | `--exclude-pid PID` | 按 PID 排除该进程树。 |
 | `--output NAME` | 输出设备，默认 `Line 1 (Virtual Audio Cable)`。先精确匹配，再找唯一的子串匹配。 |
 | `--buffer-ms N` | 抖动缓冲，默认 20，最小 11。 |

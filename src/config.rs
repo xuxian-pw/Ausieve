@@ -8,6 +8,10 @@ use crate::procs::normalize_path;
 
 pub const DEFAULT_OUTPUT: &str = "Line 1 (Virtual Audio Cable)";
 
+/// Programs listed (not selected) in a freshly created config. Discord moves to a new
+/// `app-<version>` folder on every update, hence the pattern.
+pub const PRESET_PROGRAMS: &[&str] = &[r"%LOCALAPPDATA%\Discord\app-*\Discord.exe"];
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -60,7 +64,12 @@ impl Config {
         let _ = std::fs::copy(&old, path);
     }
 
-    /// Loads the config; a missing file gives the defaults.
+    /// The settings of a first run: the defaults plus [`PRESET_PROGRAMS`].
+    pub fn first_run() -> Config {
+        Config { programs: PRESET_PROGRAMS.iter().map(|s| s.to_string()).collect(), ..Config::default() }
+    }
+
+    /// Loads the config; a missing file gives [`Config::first_run`].
     pub fn load(path: &Path) -> Result<Config, String> {
         match std::fs::read_to_string(path) {
             Ok(s) => {
@@ -68,7 +77,7 @@ impl Config {
                 c.fix_up();
                 Ok(c)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::first_run()),
             Err(e) => Err(format!("{}: {e}", path.display())),
         }
     }
@@ -142,7 +151,10 @@ mod tests {
     #[test]
     fn missing_file_gives_defaults_and_roundtrip_works() {
         let p = tmp("roundtrip");
-        assert_eq!(Config::load(&p).unwrap(), Config::default());
+        let first = Config::load(&p).unwrap();
+        assert_eq!(first, Config::first_run());
+        assert_eq!(first.programs, PRESET_PROGRAMS, "preset listed");
+        assert_eq!(first.selected, None, "preset not selected");
         let mut c = Config::default();
         c.add_program(r"C:\Apps\Discord\Discord.exe");
         c.add_program(r"D:\Games\Voice\voice.exe");
